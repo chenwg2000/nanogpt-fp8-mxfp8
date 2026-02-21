@@ -22,24 +22,25 @@ import torch.distributed as dist
 from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.device_mesh import init_device_mesh
 
+#USE_FP8 = True
 USE_FP8 = True
 USE_NVFP4 = False
 USE_COMPILE_MODEL = False
 USE_AMP = True
 USE_FP8_WEIGHTS = False # TODO: currently not supported
-USE_FSDP2 = True  
-USE_DDP = False  # For clarity - only one of FSDP2, DDP should be True
+USE_FSDP2 = False
+USE_DDP = True # For clarity - only one of FSDP2, DDP should be True
 USE_AC_LM_HEAD = False  # Enable activation checkpointing for lm_head
 
 # Wandb logging
-USE_WANDB = True
+USE_WANDB = False 
 WANDB_PROJECT = "nanogpt-fp8"
 WANDB_RUN_NAME = None  # Set to None for auto-generated name
 
 
 # hyperparameters
 total_batch_size = 512000 # total tokens per batch
-batch_size = 6 # how many independent sequences will we process in parallel?
+batch_size = 3  # how many independent sequences will we process in parallel?
 block_size = 2048 # what is the maximum context length for predictions?
 max_iters = 5000
 learning_rate = 1e-3
@@ -64,10 +65,10 @@ check_compute_capability = te.get_device_compute_capability()
 
 if USE_NVFP4:
     # RTX 5000 series and RTX Pro 6000 do not support rht and sr as of TE==2.9.0
-    is_rtx = check_compute_capability == (12,0) 
+    is_rtx = check_compute_capability == (12,0)
     recipe = NVFP4BlockScaling(disable_rht=is_rtx,disable_stochastic_rounding=is_rtx)
 else:
-    recipe = DelayedScaling()
+    recipe = MXFP8BlockScaling()
 
 if USE_DDP or USE_FSDP2:
     init_process_group(backend='nccl')
@@ -92,7 +93,7 @@ else:
     device_mesh = None
 
 # GPU configuration for MFU calculation
-GPU_PEAK_TFLOPS = 2250  # B200 BF16 peak TFLOPS per GPU
+GPU_PEAK_TFLOPS = 404  # B200 BF16 peak TFLOPS per GPU
 NUM_GPUS = ddp_world_size  # Number of GPUs being used
 
 grad_accum_steps = max(1, math.ceil(total_batch_size / (batch_size * ddp_world_size*block_size)))
@@ -461,7 +462,7 @@ unembedding_params = [*raw_model.lm_head.parameters()]
 
 param_groups = [
     dict(params=hidden_weights,lr=0.02), 
-    dict(params=hidden_gains_biases+nonhidden_params, algorithm="adamw",lr=0.2, betas=(0.9, 0.95), weight_decay=0.01),
+    dict(params=hidden_gains_biases+nonhidden_params, algorithm="adamw",lr=2e-3, betas=(0.9, 0.95), weight_decay=0.01),
     dict(params=unembedding_params, algorithm="adamw",lr=0.004, betas=(0.9, 0.95), weight_decay=0.01)
 ]
 
