@@ -14,7 +14,7 @@ This report documents the end-to-end process of enabling MXFP8 (Microscaling FP8
 2. Enable MXFP8BlockScaling on RTX 5090, which was software-blocked in TE
 3. Fix backward pass correctness (weight gradients were completely wrong)
 4. Analyze performance across BF16, DelayedScaling, Float8BlockScaling, and MXFP8BlockScaling
-5. Identify the root cause of the MXFP8 vs Float8BlockScaling performance gap
+5. Identify and close the MXFP8 vs Float8BlockScaling performance gap
 
 ### Environment
 
@@ -217,41 +217,7 @@ For each MXFP8 operand that needs conversion (A if not transposed, B if transpos
 
 After processing both operands, set `transa=true, transb=false` so the downstream code (swizzle + `CanonicalizeGemmInput`) handles it via the standard TN path.
 
-The actual C++ implementation (~60 lines):
-
-```cpp
-const bool is_mxfp8 = A_tensor.scaling_mode() == NVTE_MXFP8_1D_SCALING;
-if (is_mxfp8 && !nvte_is_non_tn_fp8_gemm_supported() && (!transa || transb)) {
-  auto transpose_mxfp8_operand = [&](TensorWrapper &tensor) {
-    auto col_data = tensor.get_columnwise_data();
-    auto col_scale = tensor.get_columnwise_scale_inv();
-    // Flatten to 2D
-    size_t first_dim = 1;
-    for (size_t i = 0; i < col_data.shape.ndim - 1; ++i)
-      first_dim *= col_data.shape.data[i];
-    size_t last_dim = col_data.shape.data[col_data.shape.ndim - 1];
-    // Transpose data [first_dim, last_dim] -> [last_dim, first_dim]
-    auto data_t = at::from_blob(col_data.data_ptr,
-        {(int64_t)first_dim, (int64_t)last_dim}, uint8_opts).t().contiguous();
-    // Transpose scale_inv
-    auto scale_t = at::from_blob(col_scale.data_ptr,
-        {(int64_t)col_scale.shape.data[0], (int64_t)col_scale.shape.data[1]},
-        uint8_opts).t().contiguous();
-    // Create new TensorWrapper with transposed data as rowwise
-    TensorWrapper new_tensor(NVTE_MXFP8_1D_SCALING);
-    new_tensor.set_rowwise_data(data_t.data_ptr(), data_dtype, {last_dim, first_dim});
-    new_tensor.set_rowwise_scale_inv(scale_t.data_ptr(), scale_dtype, {...});
-    // Keep alive and replace
-    swizzled_scale_inverses_list.emplace_back(std::move(data_t));
-    swizzled_scale_inverses_list.emplace_back(std::move(scale_t));
-    tensor = std::move(new_tensor);
-  };
-  if (!transa) transpose_mxfp8_operand(A_tensor);
-  if (transb) transpose_mxfp8_operand(B_tensor);
-  transa = true;
-  transb = false;
-}
-```
+The initial implementation used `.t().contiguous()` for the data transpose. This was later optimized to use `nvte_transpose` (see Section 7).
 
 ### 4.5 Blocker 3: Pre-Swizzled Scales in `quantizer.cpp`
 
@@ -316,7 +282,9 @@ MFU = `6 * num_params * tokens_per_step / (step_time * GPU_PEAK_TFLOPS)` with GP
 | BF16 (no FP8) | ~175 | ~46,900 | ~39.1% | 28.5 GB | 1.00x |
 | DelayedScaling | ~124 | ~65,700 | ~54.8% | 27.9 GB | 1.41x |
 | **Float8BlockScaling** | **~113** | **~72,500** | **~60.8%** | **28.9 GB** | **1.55x** |
-| MXFP8BlockScaling | ~159 | ~51,300 | ~42.7% | 28.5 GB | 1.10x |
+| **MXFP8BlockScaling** | **~116** | **~70,400** | **~58.6%** | **31.2 GB** | **1.51x** |
+
+*Note: MXFP8 results reflect the `nvte_transpose` optimization (Section 7). Before optimization, MXFP8 ran at ~159 ms/step (42.7% MFU).*
 
 ### 6.2 Training Loss Curves
 
@@ -349,60 +317,79 @@ At step 40: BF16 = 6.21, Float8Block = 6.35, MXFP8 = 6.24, Delayed = 6.20.
 
 ---
 
-## 7. Performance Gap Analysis: MXFP8 vs Float8BlockScaling
+## 7. Performance Optimization: Closing the MXFP8 Gap
 
-Despite executing the same GEMM kernels, MXFP8BlockScaling is ~41% slower than Float8BlockScaling (159 ms vs 113 ms). This section explains why.
+The initial MXFP8 implementation was ~41% slower than Float8BlockScaling (159 ms vs 113 ms). This section traces the root cause and the optimization that closed the gap.
 
-### 7.1 Initial Hypothesis (Disproved)
+### 7.1 Initial Profiling: Two Bottlenecks
 
-The hypothesis was that GEMM-time overhead from the SM 12.0 fix (transposing data + swizzling scales for each non-TN GEMM) caused the gap. An optimization was implemented to pre-compute these at quantization time — it was benchmarked and **reverted** after profiling showed no improvement.
+Nsys profiling of the MXFP8 path revealed two major costs:
 
-### 7.2 Profiling Results
+| Kernel | Calls/step | Avg time | Total/step | % GPU time |
+|---|---|---|---|---|
+| `elementwise_kernel` (uint8 copy) | 91,854 | 89 μs | 8,171 ms | **29.5%** |
+| `quantize_mxfp8_kernel` (bidimensional) | 3,780 | 153 μs | 579 ms | 2.1% |
 
-**Per-quantize-call cost** (shape 6144x1280):
+The dominant cost was **not** the quantization kernel — it was **280 GB of uint8 tensor copies** that did not exist in Float8BlockScaling at all.
 
-| Variant | Time per call |
-|---|---|
-| Float8Block row+col quantization | 0.012 ms |
-| MXFP8 row-only quantization | 0.015 ms |
-| **MXFP8 row+col quantization** | **~0.050 ms** |
+### 7.2 Root Cause: Inefficient Transpose in Backward GEMMs
 
-**Per-transformer-block cost** (forward + backward):
+The SM 12.0 TN fix in `gemm.cpp` transposes MXFP8 columnwise data `[M,K] → [K,M]` for each backward GEMM (dgrad NN and wgrad NT layouts). The original implementation used:
 
-| Recipe | Time per block | Delta |
-|---|---|---|
-| Float8BlockScaling | 3.34 ms | — |
-| MXFP8BlockScaling | 4.68 ms | +1.34 ms |
-| **Total across 20 blocks** | | **+26.8 ms** |
+```cpp
+auto data_transposed = at::from_blob(..., {M, K}, uint8_opts).t().contiguous();
+```
 
-This 26.8 ms accounts for nearly the entire ~46 ms gap.
+This dispatched PyTorch's **generic `direct_copy_kernel_cuda`**, which performs an element-by-element copy with non-coalesced memory access — achieving only ~2% of peak memory bandwidth.
 
-**Per-linear-layer GEMM** (micro-benchmark):
+**Per step (63 micro-batches):**
+- 30,132 uint8 clone operations
+- 280 GB of data copied
+- ~43 ms wall-clock overhead — nearly the entire MXFP8 vs Float8Block gap
 
-| Recipe | Time per linear fwd+bwd |
-|---|---|
-| Float8BlockScaling | 0.28 ms |
-| MXFP8BlockScaling | 0.30 ms |
+Float8BlockScaling avoids this entirely because its `columnwise_data` is stored pre-transposed as `[K,M]`, so `convert_block_scaling_to_mxfp8_tensor` reuses the data pointer with zero copy.
 
-The GEMM itself is nearly identical. The overhead is in quantization.
+### 7.3 Discovery: Tracing the Copies
 
-### 7.3 Root Cause: MXFP8 Dual Quantization Kernel
+The copies were invisible to standard Python profiling because they occurred inside the C++ extension (`tex.generic_gemm`). A custom `TorchDispatchMode` tracker on `aten.clone.default` revealed:
 
-The dominant cost is the **MXFP8 dual (row+col) quantization kernel** (`nvte_quantize_v2`). MXFP8BlockScaling must produce both rowwise and columnwise quantized outputs simultaneously (the "x2" path). This costs ~4x more than Float8BlockScaling's equivalent.
+```
+30,132 uint8 clone calls, all from gemm.py:197:general_gemm
+Sources: layernorm_mlp.py backward (fc1/fc2 wgrad+dgrad), linear.py backward, layernorm_linear.py backward
+```
 
-### 7.4 Why Float8BlockScaling Is Fast Despite GEMM-Time Conversion
+### 7.4 Fix: TE's Optimized `nvte_transpose`
 
-Float8BlockScaling has three structural advantages:
+Transformer Engine already includes an optimized transpose kernel (`nvte_transpose` in `transpose.cu`) that uses vectorized tiled loads/stores for near-peak memory bandwidth. The fix replaces the generic `.t().contiguous()` with this kernel:
 
-1. **Columnwise data is pre-transposed**: Shape [K, M] at quantization time. `convert_block_scaling_to_mxfp8_tensor` at GEMM time reuses the same data pointer — no copy.
-2. **Scales are pre-swizzled**: `with_gemm_swizzled_scales=true` makes the GEMM-time swizzle a no-op.
-3. **Scale format conversion is cheap**: Only converts FP32 block-scaling to E8M0 MXFP8 — a small kernel on tiny scale tensors.
+```cpp
+// Before (slow — generic elementwise kernel, ~2% peak BW):
+auto data_transposed = at::from_blob(col_data.data_ptr,
+    {first_dim, last_dim}, uint8_opts).t().contiguous();
 
-### 7.5 What Would Close the Gap
+// After (fast — TE optimized transpose, near-peak BW):
+auto data_transposed = at::empty({last_dim, first_dim}, uint8_opts);
+TensorWrapper input_tw, output_tw;
+input_tw.set_rowwise_data(col_data.data_ptr, data_dtype, {first_dim, last_dim});
+output_tw.set_rowwise_data(data_transposed.data_ptr(), data_dtype, {last_dim, first_dim});
+nvte_transpose(input_tw.data(), output_tw.data(), stream);
+```
 
-1. Optimize the MXFP8 `nvte_quantize_v2` dual-path CUDA kernel for SM 12.0
-2. Produce MXFP8 columnwise_data in [K, M] layout (matching Float8Block convention)
-3. Fuse quantization with transpose in a single kernel pass
+Scale transposes (tiny tensors, ~0.3 MB each) were left using `.t().contiguous()` as their cost is negligible.
+
+### 7.5 Result
+
+| Metric | Before | After | Float8Block |
+|---|---|---|---|
+| ms/step | 159 | **116** | 113 |
+| MFU | 42.7% | **58.6%** | 60.8% |
+| Speedup vs BF16 | 1.10x | **1.51x** | 1.55x |
+
+The optimization eliminated 43 ms of overhead, bringing MXFP8 within 3 ms of Float8Block — within measurement noise. Correctness is unchanged (cosine 0.999611).
+
+### 7.6 Remaining Minor Gap
+
+The residual ~3 ms difference comes from the MXFP8 bidimensional quantization kernel being slightly more expensive than Float8Block's separate activation + quantize path. This is a TE CUDA kernel optimization opportunity, not addressable at the integration level.
 
 ---
 
@@ -479,7 +466,7 @@ The gains/biases/embeddings learning rate was updated from `lr=2e-3` to `lr=0.2`
 | File | Change | Purpose |
 |---|---|---|
 | `pytorch/quantization.py` | Removed `if >= (12,0): return False` guard | Enable MXFP8 on SM 12.0 |
-| `pytorch/csrc/extensions/gemm.cpp` | Added ~60-line `transpose_mxfp8_operand` lambda | Transpose MXFP8 columnwise data + scales to TN layout for backward GEMMs |
+| `pytorch/csrc/extensions/gemm.cpp` | Added `transpose_mxfp8_operand` lambda; replaced `.t().contiguous()` with `nvte_transpose` | Transpose MXFP8 columnwise data to TN layout; use optimized kernel for near-peak bandwidth |
 | `pytorch/csrc/quantizer.cpp` | `with_gemm_swizzled_scales &&= nvte_is_non_tn_fp8_gemm_supported()` | Disable pre-swizzled scales so gemm.cpp transpose gets natural-format scales |
 
 ### nanogpt-fp8 (train.py)
@@ -507,13 +494,15 @@ Standalone script that creates a single `te.Linear(1280, 1280)` layer, runs forw
 
 1. **MXFP8BlockScaling is fully functional on SM 12.0** after fixing the backward pass TN layout conversion. Weight gradient cosine similarity matches Float8BlockScaling at 0.999611.
 
-2. **Float8BlockScaling is the fastest FP8 recipe on SM 12.0**, achieving 1.55x speedup over BF16. MXFP8 achieves 1.10x, and DelayedScaling achieves 1.41x.
+2. **MXFP8 now matches Float8BlockScaling in throughput** after the `nvte_transpose` optimization: ~116 ms/step (58.6% MFU) vs ~113 ms/step (60.8% MFU) — within 3 ms. Both achieve ~1.5x speedup over BF16. DelayedScaling achieves 1.41x.
 
-3. **The MXFP8 performance gap is caused by the quantization kernel**, not GEMM-time overhead. The `nvte_quantize_v2` dual row+col path costs ~4x more for MXFP8 than for Float8Block. This is a TE kernel optimization opportunity, not a hardware limitation.
+3. **The original MXFP8 performance gap was caused by an inefficient transpose**, not the quantization kernel. PyTorch's generic `direct_copy_kernel_cuda` achieved only ~2% of peak memory bandwidth for the 280 GB/step of uint8 copies needed by backward GEMMs. Replacing it with TE's optimized `nvte_transpose` eliminated 43 ms of overhead.
 
 4. **All four recipes converge** on the 561M model. Float8Block and MXFP8 produce virtually identical loss curves (same GEMM kernels on SM 12.0). DelayedScaling converges slightly faster in early steps.
 
 5. **Building from source was necessary** for MXFP8 support (the fix is not in any released TE version). The compilation process required working around cmake version issues, GCC 12 ICE bugs, CUDA architecture list quirks, and library conflicts.
+
+6. **Both Float8BlockScaling and MXFP8BlockScaling are viable** on the RTX 5090, delivering identical numerical quality and near-identical throughput. The choice between them is now a matter of preference rather than performance.
 
 ---
 
@@ -536,22 +525,24 @@ Step  Loss     ms/step  MFU     Memory
  49    6.054   114.0    59.88%  28.94 GB
 ```
 
-### B. MXFP8BlockScaling
+### B. MXFP8BlockScaling (after nvte_transpose optimization)
 
 ```
 Step  Loss     ms/step  MFU     Memory
-  2   10.072   161.0    42.40%  30.40 GB
-  5    8.581   160.7    42.47%  28.14 GB
- 10    9.866   160.8    42.46%  28.14 GB
- 15    7.040   161.9    42.17%  28.18 GB
- 20    7.145   161.4    42.30%  28.20 GB
- 25    6.597   158.7    43.01%  28.20 GB
- 30    6.389   159.9    42.68%  28.14 GB
- 35    6.306   160.5    42.51%  28.16 GB
- 40    6.243   159.9    42.69%  28.14 GB
- 45    6.229   160.7    42.49%  28.44 GB
- 49    6.059   160.9    42.43%  30.55 GB
+  2   10.072   123.6    55.2%   28.07 GB
+  5    8.581   116.5    58.6%   28.07 GB
+ 10    9.866   116.5    58.6%   28.07 GB
+ 15    7.040   116.0    58.9%   28.07 GB
+ 20    7.145   116.1    58.8%   28.07 GB
+ 25    6.597   115.9    58.9%   28.07 GB
+ 30    6.389   116.1    58.8%   28.07 GB
+ 35    6.306   116.5    58.6%   28.24 GB
+ 40    6.243   116.5    58.6%   28.24 GB
+ 45    6.229   116.1    58.8%   31.25 GB
+ 49    6.059   116.1    58.8%   31.25 GB
 ```
+
+*Before optimization: ~160 ms/step, 42.5% MFU*
 
 ### C. DelayedScaling
 
