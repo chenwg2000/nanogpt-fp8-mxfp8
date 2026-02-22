@@ -22,8 +22,7 @@ import torch.distributed as dist
 from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.device_mesh import init_device_mesh
 
-#USE_FP8 = True
-USE_FP8 = True
+USE_FP8 = os.environ.get('USE_FP8', 'True').lower() != 'false'
 USE_NVFP4 = False
 USE_COMPILE_MODEL = False
 USE_AMP = True
@@ -40,9 +39,9 @@ WANDB_RUN_NAME = None  # Set to None for auto-generated name
 
 # hyperparameters
 total_batch_size = 512000 # total tokens per batch
-batch_size = 3  # how many independent sequences will we process in parallel?
+batch_size = int(os.environ.get('BATCH_SIZE', '3'))  # how many independent sequences will we process in parallel?
 block_size = 2048 # what is the maximum context length for predictions?
-max_iters = 5000
+max_iters = int(os.environ.get('MAX_ITERS', '5000'))
 learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 50
@@ -63,10 +62,15 @@ min_lr = 1e-8  # Minimum learning rate (10% of max LR is typical)
 
 check_compute_capability = te.get_device_compute_capability()
 
+RECIPE_NAME = os.environ.get('RECIPE', 'MXFP8BlockScaling')
 if USE_NVFP4:
     # RTX 5000 series and RTX Pro 6000 do not support rht and sr as of TE==2.9.0
     is_rtx = check_compute_capability == (12,0)
     recipe = NVFP4BlockScaling(disable_rht=is_rtx,disable_stochastic_rounding=is_rtx)
+elif RECIPE_NAME == 'Float8BlockScaling':
+    recipe = Float8BlockScaling()
+elif RECIPE_NAME == 'DelayedScaling':
+    recipe = DelayedScaling()
 else:
     recipe = MXFP8BlockScaling()
 
@@ -462,15 +466,17 @@ unembedding_params = [*raw_model.lm_head.parameters()]
 
 param_groups = [
     dict(params=hidden_weights,lr=0.02), 
-    dict(params=hidden_gains_biases+nonhidden_params, algorithm="adamw",lr=2e-3, betas=(0.9, 0.95), weight_decay=0.01),
+    dict(params=hidden_gains_biases+nonhidden_params, algorithm="adamw",lr=0.2, betas=(0.9, 0.95), weight_decay=0.01),
     dict(params=unembedding_params, algorithm="adamw",lr=0.004, betas=(0.9, 0.95), weight_decay=0.01)
 ]
 
 from dion import Muon,NorMuon,Dion2,Dion
 
-optimizer_muon = Muon(param_groups,
+optimizer_muon = NorMuon(param_groups,
                         distributed_mesh=device_mesh if (USE_FSDP2) else data_parallel_group if (USE_DDP) else None,
-                        use_triton=True, 
+                        use_triton=True,
+                        weight_decay=0.01,
+                        cautious_wd=True,
                         )
 
     

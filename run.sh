@@ -1,1 +1,1 @@
-OMP_NUM_THREADS=16  torchrun --standalone --nproc-per-node=8 train.py 
+OMP_NUM_THREADS=1  torchrun --standalone --nproc-per-node=1 train.py 

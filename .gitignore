@@ -1,4 +1,29 @@
 .venv/
-__pycache__
+__pycache__/
+*.pyc
 *.bin
 wandb/
+build/
+*.egg-info/
+.vscode/
+.idea/
+.claude/
+
+# Private notes
+note_cwg.txt
+CLAUDE.md
+
+# Old/intermediate patch files (canonical ones are in patches/)
+mxfp8_sm120_support.patch
+transformer_engine_mxfp8_sm120.patch
+nanogpt_fp8_changes.patch
+te_mxfp8_nanogpt_patches.zip
+
+# Individual interim reports (complete report covers everything)
+report_mxfp8_sm120.md
+report_mxfp8_perf_analysis.md
+report_fp8_comparison.md
+report_pip_vs_source.md
+
+# PDF generation helper
+md_to_pdf.py
