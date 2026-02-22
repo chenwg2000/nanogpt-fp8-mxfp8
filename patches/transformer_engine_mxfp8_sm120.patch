@@ -1,0 +1,230 @@
+diff --git a/transformer_engine/common/gemm/cublaslt_gemm.cu b/transformer_engine/common/gemm/cublaslt_gemm.cu
+index c58c3cb4..c22abceb 100644
+--- a/transformer_engine/common/gemm/cublaslt_gemm.cu
++++ b/transformer_engine/common/gemm/cublaslt_gemm.cu
+@@ -177,16 +177,31 @@ GemmParam CanonicalizeGemmInput(const transformer_engine::Tensor &A, const cubla
+     // Note: Row-wise and column-wise data are scaled along different
+     // dimensions (with matrix interpreted in row-major order).
+ 
+-    if (is_A_transposed) {
+-      NVTE_CHECK(A.has_data(), "Input A is missing row-wise usage");
+-    } else {
++    if (!nvte_is_non_tn_fp8_gemm_supported() && !is_A_transposed) {
++      // SM 12.0 (Blackwell consumer) only supports TN layout for MXFP8 GEMM.
++      // columnwise_data stores A^T in row-major order, so op_T on it gives A.
++      // This converts an NN or NT GEMM into TN layout with identical math result.
++      // Use A.scale_inv (rowwise, shape [m, k//32]) not A.columnwise_scale_inv ([m//32, k]):
++      // cuBLASLt MXFP8 TN GEMM expects scales indexed as scale[row][col//32] which
++      // matches rowwise layout when A is stored as [k×m] (columnwise_data) with CUBLAS_OP_T.
+       NVTE_CHECK(A.has_columnwise_data(), "Input A is missing column-wise usage");
++      ret.A = A.columnwise_data.dptr;
++      ret.transA = CUBLAS_OP_T;
++      ret.Atype = A.columnwise_data.dtype;
++      ret.A_scale_inv = A.scale_inv.dptr;
++      ret.lda = k;
++    } else {
++      if (is_A_transposed) {
++        NVTE_CHECK(A.has_data(), "Input A is missing row-wise usage");
++      } else {
++        NVTE_CHECK(A.has_columnwise_data(), "Input A is missing column-wise usage");
++      }
++      ret.A = is_A_transposed ? A.data.dptr : A.columnwise_data.dptr;
++      ret.transA = transA;
++      ret.Atype = is_A_transposed ? A.data.dtype : A.columnwise_data.dtype;
++      ret.A_scale_inv = is_A_transposed ? A.scale_inv.dptr : A.columnwise_scale_inv.dptr;
++      ret.lda = is_A_transposed ? k : m;
+     }
+-    ret.A = is_A_transposed ? A.data.dptr : A.columnwise_data.dptr;
+-    ret.transA = transA;
+-    ret.Atype = is_A_transposed ? A.data.dtype : A.columnwise_data.dtype;
+-    ret.A_scale_inv = is_A_transposed ? A.scale_inv.dptr : A.columnwise_scale_inv.dptr;
+-    ret.lda = is_A_transposed ? k : m;
+   } else if (A.scaling_mode == NVTE_BLOCK_SCALING_1D || A.scaling_mode == NVTE_BLOCK_SCALING_2D) {
+     // FP8 block scaling
+     // Note: Hopper only supports TN GEMMs for FP8. "Column-wise data" is transpose of data.
+@@ -262,16 +277,31 @@ GemmParam CanonicalizeGemmInput(const transformer_engine::Tensor &A, const cubla
+     ret.B_scale_inv = is_B_transposed ? B.columnwise_scale_inv.dptr : B.scale_inv.dptr;
+     ret.ldb = k;
+   } else if (mxfp8) {
+-    if (is_B_transposed) {
++    if (!nvte_is_non_tn_fp8_gemm_supported() && is_B_transposed) {
++      // SM 12.0 (Blackwell consumer) only supports TN layout for MXFP8 GEMM.
++      // columnwise_data stores B^T in row-major order, so op_N on it gives B^T already,
++      // converting a TT or NT GEMM into TN layout with identical math result.
++      // Use B.scale_inv (rowwise, shape [k, n//32]) not B.columnwise_scale_inv (shape
++      // [k//32, n]): cuBLASLt indexes MXFP8 scales as scale[row][col//32] for a [k×n]
++      // matrix, which matches the rowwise layout exactly.
+       NVTE_CHECK(B.has_columnwise_data(), "Input B is missing column-wise usage");
++      ret.B = B.columnwise_data.dptr;
++      ret.transB = CUBLAS_OP_N;
++      ret.Btype = B.columnwise_data.dtype;
++      ret.B_scale_inv = B.scale_inv.dptr;
++      ret.ldb = k;
+     } else {
+-      NVTE_CHECK(B.has_data(), "Input B is missing row-wise usage");
++      if (is_B_transposed) {
++        NVTE_CHECK(B.has_columnwise_data(), "Input B is missing column-wise usage");
++      } else {
++        NVTE_CHECK(B.has_data(), "Input B is missing row-wise usage");
++      }
++      ret.B = is_B_transposed ? B.columnwise_data.dptr : B.data.dptr;
++      ret.transB = transB;
++      ret.Btype = is_B_transposed ? B.columnwise_data.dtype : B.data.dtype;
++      ret.B_scale_inv = is_B_transposed ? B.columnwise_scale_inv.dptr : B.scale_inv.dptr;
++      ret.ldb = is_B_transposed ? n : k;
+     }
+-    ret.B = is_B_transposed ? B.columnwise_data.dptr : B.data.dptr;
+-    ret.transB = transB;
+-    ret.Btype = is_B_transposed ? B.columnwise_data.dtype : B.data.dtype;
+-    ret.B_scale_inv = is_B_transposed ? B.columnwise_scale_inv.dptr : B.scale_inv.dptr;
+-    ret.ldb = is_B_transposed ? n : k;
+   } else if (B.scaling_mode == NVTE_BLOCK_SCALING_1D || B.scaling_mode == NVTE_BLOCK_SCALING_2D) {
+     // FP8 block scaling
+     // Note: Hopper only supports TN GEMMs for FP8. "Column-wise data" is transpose of data.
+diff --git a/transformer_engine/pytorch/csrc/extensions/gemm.cpp b/transformer_engine/pytorch/csrc/extensions/gemm.cpp
+index d75b0f14..0fd015dc 100644
+--- a/transformer_engine/pytorch/csrc/extensions/gemm.cpp
++++ b/transformer_engine/pytorch/csrc/extensions/gemm.cpp
+@@ -16,6 +16,7 @@
+ #include "common/util/system.h"
+ #include "pybind.h"
+ #include "transformer_engine/transformer_engine.h"
++#include "transformer_engine/transpose.h"
+ #include "util.h"
+ 
+ namespace {
+@@ -239,6 +240,81 @@ std::vector<py::object> gemm(py::handle A, bool transa, py::handle B, bool trans
+   std::vector<std::optional<at::Tensor>> swizzled_scale_inverses_list;
+   auto main_stream = at::cuda::getCurrentCUDAStream();
+   if (A_tensor.numel() != 0 && B_tensor.numel() != 0) {
++    // SM 12.0 MXFP8 TN conversion: transpose columnwise data to create TN-compatible rowwise data.
++    // MXFP8 columnwise_data has the SAME shape as the original tensor (not transposed like
++    // Float8BlockScaling). On SM 12.0, cuBLASLt only supports TN layout for MXFP8 GEMM.
++    // We transpose the data and scales here so the downstream swizzle and GEMM code sees
++    // TN-ready rowwise tensors.
++    const bool is_mxfp8 = A_tensor.scaling_mode() == NVTE_MXFP8_1D_SCALING;
++    if (is_mxfp8 && !nvte_is_non_tn_fp8_gemm_supported() && (!transa || transb)) {
++      auto transpose_mxfp8_operand = [&swizzled_scale_inverses_list](
++          TensorWrapper &tensor) {
++        // Get columnwise data (same shape as original, NOT transposed for MXFP8)
++        auto col_data = tensor.get_columnwise_data();
++        auto col_scale = tensor.get_columnwise_scale_inv();
++
++        // Flatten data shape to 2D: [first_dim, last_dim]
++        size_t first_dim = 1;
++        for (size_t i = 0; i < col_data.shape.ndim - 1; ++i) {
++          first_dim *= col_data.shape.data[i];
++        }
++        size_t last_dim = col_data.shape.data[col_data.shape.ndim - 1];
++
++        // Transpose data: [first_dim, last_dim] -> [last_dim, first_dim]
++        // Use TE's optimized nvte_transpose which uses vectorized loads/stores.
++        auto uint8_opts = at::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
++        auto data_transposed = at::empty(
++            {static_cast<int64_t>(last_dim), static_cast<int64_t>(first_dim)}, uint8_opts);
++        {
++          // Create TE tensors for the transpose call
++          auto data_dtype = static_cast<DType>(col_data.dtype);
++          TensorWrapper input_tw, output_tw;
++          input_tw.set_rowwise_data(col_data.data_ptr, data_dtype,
++                                    std::vector<size_t>{first_dim, last_dim});
++          output_tw.set_rowwise_data(data_transposed.data_ptr(), data_dtype,
++                                     std::vector<size_t>{last_dim, first_dim});
++          auto stream = at::cuda::getCurrentCUDAStream().stream();
++          nvte_transpose(input_tw.data(), output_tw.data(), stream);
++        }
++
++        // Transpose scale_inv (small tensor, standard transpose is fine)
++        size_t scale_first = col_scale.shape.data[0];
++        size_t scale_last = col_scale.shape.data[1];
++        auto scale_transposed = at::from_blob(
++            col_scale.data_ptr,
++            {static_cast<int64_t>(scale_first), static_cast<int64_t>(scale_last)},
++            uint8_opts).t().contiguous();
++
++        // Create new TensorWrapper with transposed data as rowwise
++        std::vector<size_t> new_data_shape = {last_dim, first_dim};
++        std::vector<size_t> new_scale_shape = {
++            static_cast<size_t>(scale_last), static_cast<size_t>(scale_first)};
++        auto data_dtype = static_cast<DType>(col_data.dtype);
++        auto scale_dtype = static_cast<DType>(col_scale.dtype);
++
++        TensorWrapper new_tensor(NVTE_MXFP8_1D_SCALING);
++        new_tensor.set_rowwise_data(
++            data_transposed.data_ptr(), data_dtype, new_data_shape);
++        new_tensor.set_rowwise_scale_inv(
++            scale_transposed.data_ptr(), scale_dtype, new_scale_shape);
++
++        // Keep transposed tensors alive during the GEMM
++        swizzled_scale_inverses_list.emplace_back(std::move(data_transposed));
++        swizzled_scale_inverses_list.emplace_back(std::move(scale_transposed));
++
++        tensor = std::move(new_tensor);
++      };
++
++      if (!transa) {
++        transpose_mxfp8_operand(A_tensor);
++      }
++      if (transb) {
++        transpose_mxfp8_operand(B_tensor);
++      }
++      transa = true;
++      transb = false;
++    }
++
+     // Optionally swizzle the scaling factors
+     auto [A_row_scales, A_col_scales] = swizzle_scales_for_gemm(A_tensor, transa, !transa);
+     auto [B_row_scales, B_col_scales] = swizzle_scales_for_gemm(B_tensor, !transb, transb);
+diff --git a/transformer_engine/pytorch/csrc/quantizer.cpp b/transformer_engine/pytorch/csrc/quantizer.cpp
+index 1c968e27..7caa3312 100644
+--- a/transformer_engine/pytorch/csrc/quantizer.cpp
++++ b/transformer_engine/pytorch/csrc/quantizer.cpp
+@@ -862,7 +862,10 @@ std::pair<TensorWrapper, py::object> MXFP8Quantizer::create_tensor(const std::ve
+   using namespace pybind11::literals;
+ 
+   // Scaling factor format
+-  const bool with_gemm_swizzled_scales = this->optimize_for_gemm;
++  // On SM 12.0, MXFP8 non-TN GEMM is not supported. The TN fallback in gemm.cpp
++  // transposes columnwise data+scales, which requires unswizzled (natural) scale format.
++  const bool with_gemm_swizzled_scales =
++      this->optimize_for_gemm && nvte_is_non_tn_fp8_gemm_supported();
+ 
+   // Tensor dimensions
+   const std::vector<int64_t> shape_int64(shape.begin(), shape.end());
+@@ -945,7 +948,10 @@ std::pair<TensorWrapper, py::object> MXFP8Quantizer::convert_and_update_tensor(
+   NVTE_CHECK(detail::IsMXFP8Tensor(tensor.ptr()), "MXFP8Quantizer must output to MXFP8Tensor.");
+ 
+   // Scaling factor format
+-  const bool with_gemm_swizzled_scales = this->optimize_for_gemm;
++  // On SM 12.0, MXFP8 non-TN GEMM is not supported. The TN fallback in gemm.cpp
++  // transposes columnwise data+scales, which requires unswizzled (natural) scale format.
++  const bool with_gemm_swizzled_scales =
++      this->optimize_for_gemm && nvte_is_non_tn_fp8_gemm_supported();
+ 
+   // Extract buffers from Python tensor
+   auto get_tensor = [&tensor](const char* name) -> std::optional<at::Tensor> {
+diff --git a/transformer_engine/pytorch/quantization.py b/transformer_engine/pytorch/quantization.py
+index eba547af..7dd7d840 100644
+--- a/transformer_engine/pytorch/quantization.py
++++ b/transformer_engine/pytorch/quantization.py
+@@ -61,9 +61,7 @@ def check_fp8_support() -> Tuple[bool, str]:
+ @functools.lru_cache(maxsize=None)
+ def check_mxfp8_support() -> Tuple[bool, str]:
+     """Return if fp8 support is available"""
+-    if get_device_compute_capability() >= (12, 0):
+-        return False, "MXFP8 (for all gemm layouts) is not supported on 12.0+ architectures yet."
+-    if get_device_compute_capability() >= (10, 0):  # blackwell and above
++    if get_device_compute_capability() >= (10, 0):  # Blackwell and above (SM 10.0+, including SM 12.0)
+         return True, ""
+     return False, "Device compute capability 10.0 or higher required for MXFP8 execution."
+ 
+@@ -104,9 +102,6 @@ def get_default_fp8_recipe() -> Recipe:
+     """FP8 recipe with default args."""
+     if check_mxfp8_support()[0]:
+         return MXFP8BlockScaling()
+-    if get_device_compute_capability() >= (12, 0):
+-        # This is a temporary restriction until MXFP8 is supported for all gemm layouts.
+-        return Float8CurrentScaling()
+     return DelayedScaling()
+ 
+ 
