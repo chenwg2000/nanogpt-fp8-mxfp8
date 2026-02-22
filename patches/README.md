@@ -1,12 +1,12 @@
 # Patches for MXFP8 on RTX 5090 (SM 12.0)
 
-These patches enable MXFP8BlockScaling training on the NVIDIA RTX 5090 (Blackwell consumer, SM 12.0) using Transformer Engine and a nanogpt-fp8 training script.
+These patches enable and optimize MXFP8BlockScaling training on the NVIDIA RTX 5090 (Blackwell consumer, SM 12.0) using Transformer Engine and a nanogpt-fp8 training script.
 
 ## Patches
 
 ### `transformer_engine_mxfp8_sm120.patch`
 
-Apply against Transformer Engine 2.13.0.dev (commit `f8449052` or similar).
+Apply against Transformer Engine 2.13.0.dev (commit `f8449052` or similar). This is the **base patch** that enables MXFP8 and fixes backward pass correctness.
 
 **Files modified (4):**
 
@@ -17,8 +17,6 @@ Apply against Transformer Engine 2.13.0.dev (commit `f8449052` or similar).
 | `pytorch/csrc/quantizer.cpp` | +6/-2 | Disable `optimize_for_gemm` (pre-swizzled scales) for MXFP8 on SM 12.0. Changed `with_gemm_swizzled_scales = this->optimize_for_gemm` to `this->optimize_for_gemm && nvte_is_non_tn_fp8_gemm_supported()` in both `create_tensor()` and `convert_and_update_tensor()`. Required because the gemm.cpp transpose needs natural (unswizzled) scale format. |
 | `common/gemm/cublaslt_gemm.cu` | +18/-12 | Fix `CanonicalizeGemmInput()` TN fallback for MXFP8. For operand A: use `A.scale_inv` (rowwise) instead of `A.columnwise_scale_inv` when applying CUBLAS_OP_T to columnwise data. For operand B: same fix with `B.scale_inv`. cuBLASLt MXFP8 TN GEMM expects scales indexed as `scale[row][col//32]` which matches rowwise layout. |
 
-**Performance note:** The data transpose in `gemm.cpp` uses `nvte_transpose` instead of PyTorch's `.t().contiguous()`. The generic PyTorch elementwise kernel achieved only ~2% of peak memory bandwidth, causing a 43ms/step overhead (280 GB of uint8 copies per step). The optimized kernel eliminates this overhead, bringing MXFP8 to match Float8BlockScaling throughput (~116 ms/step).
-
 **How to apply:**
 
 ```bash
@@ -26,18 +24,46 @@ cd /path/to/TransformerEngine
 git apply /path/to/transformer_engine_mxfp8_sm120.patch
 ```
 
+---
+
+### `transformer_engine_mxfp8_fused_transpose.patch`
+
+Apply **on top of** `transformer_engine_mxfp8_sm120.patch`. This is an **optimization patch** that fuses the colwise transpose into the MXFP8 quantize kernel, eliminating `nvte_transpose` calls at GEMM time.
+
+**Files modified (3):**
+
+| File | Change |
+|---|---|
+| `common/cast/mxfp8/quantize_mxfp8.cuh` | Added `transpose_colwise` parameter to `quantize_mxfp8_kernel`. When enabled (SM 12.0, bidimensional, non-square): writes colwise FP8 data in `[K,M]` layout in shmem (`tid*32+i` instead of `i*64+tid`), swaps TMA store coordinates, writes scales in transposed `[K, M/32]` layout with `roundup(M/32, 4)` stride alignment. Dispatch creates transposed TMA tensor map for the colwise output. |
+| `pytorch/csrc/extensions/gemm.cpp` | Detects pre-transposed colwise data on SM 12.0 via `already_transposed` flag. When true: swaps colwise shape dims and relabels as rowwise (zero-cost, no data copy or kernel launch). Square matrices (M==K) fall back to explicit `nvte_transpose`. |
+| `common/gemm/cublaslt_gemm.cu` | Added comments clarifying scale indexing for MXFP8 TN GEMM. |
+
+**Key design decision:** Colwise data shape metadata remains `[M,K]` (unchanged). Only the physical layout changes to `[K,M]`. This avoids breaking `Tensor::shape()` which returns colwise shape when rowwise data is absent. Detection in `gemm.cpp` uses architecture check, not shape comparison.
+
+**How to apply:**
+
+```bash
+cd /path/to/TransformerEngine
+# First apply the base patch if not already applied:
+git apply /path/to/transformer_engine_mxfp8_sm120.patch
+# Then apply this optimization patch:
+git apply /path/to/transformer_engine_mxfp8_fused_transpose.patch
+```
+
 Then rebuild:
 
 ```bash
+# Rebuild common C++ library (quantize_mxfp8.cuh, cublaslt_gemm.cu):
+PATH=/usr/bin:/usr/local/bin:/usr/local/cuda/bin:$PATH \
+  cmake --build /path/to/TransformerEngine/build/cmake --parallel 16
+
 # Rebuild PyTorch extension (gemm.cpp, quantizer.cpp):
 PATH=/usr/bin:/usr/local/bin:/usr/local/cuda/bin:$PATH \
   NVTE_FRAMEWORK=pytorch MAX_JOBS=16 \
   python setup.py build_ext --inplace
-
-# Rebuild common C++ library (cublaslt_gemm.cu):
-PATH=/usr/bin:/usr/local/bin:/usr/local/cuda/bin:$PATH \
-  cmake --build /path/to/TransformerEngine/build/cmake --parallel 16
 ```
+
+**Performance:** Eliminates `nvte_transpose` kernel launches and temporary buffer allocations at GEMM time. Improvement is ~2-5 ms/step (modest since `nvte_transpose` was already fast). Main benefit is reduced kernel launch overhead.
 
 ---
 
