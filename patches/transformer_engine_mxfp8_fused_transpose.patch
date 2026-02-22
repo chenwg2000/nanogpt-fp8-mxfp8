@@ -1,0 +1,260 @@
+diff --git a/transformer_engine/common/cast/mxfp8/quantize_mxfp8.cuh b/transformer_engine/common/cast/mxfp8/quantize_mxfp8.cuh
+index 70a68132..462a3416 100644
+--- a/transformer_engine/common/cast/mxfp8/quantize_mxfp8.cuh
++++ b/transformer_engine/common/cast/mxfp8/quantize_mxfp8.cuh
+@@ -54,7 +54,8 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
+                           e8m0_t *const scales_rowwise, e8m0_t *const scales_colwise,
+                           const float *noop, float *const dbias_workspace, float *const amax_ptr,
+                           const size_t rows, const size_t cols, const size_t scale_stride_rowwise,
+-                          const size_t scale_stride_colwise) {
++                          const size_t scale_stride_colwise,
++                          const bool transpose_colwise = false) {
+ #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+   constexpr bool COMPUTE_ACTIVATIONS = IS_DACT || IS_ACT;
+   constexpr bool NO_ACTIVATIONS = !COMPUTE_ACTIVATIONS;
+@@ -112,6 +113,13 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
+ 
+   const bool rowwise_scale_is_within_bounds = SCALE_DIM_X * scales_offset_X_rowwise < cols;
+ 
++  // For transpose_colwise: write colwise output in [K, M] layout in shmem
++  // instead of the default [M, K] layout. This eliminates nvte_transpose at GEMM time.
++  // Original: shmem[buff*BUFF_DIM + tid + i*BUFF_DIM_X]  (row i, col tid)
++  // Transposed: shmem[buff*BUFF_DIM + tid*BUFF_DIM_Y + i]  (row tid, col i)
++  const size_t colwise_out_base = transpose_colwise ? tid_X_colwise * BUFF_DIM_Y : tid_X_colwise;
++  const size_t colwise_out_stride = transpose_colwise ? size_t(1) : BUFF_DIM_X;
++
+   // helps resolving bank conflicts in shmem
+   const int thread_lane = threadIdx.x % THREADS_PER_WARP;
+   const int bank_group = thread_lane / THREADS_PER_BANK;
+@@ -274,14 +282,24 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
+         scale_idx = gemm_swizzled_scale_idx(global_scales_offset_X, global_scales_offset_Y,
+                                             DIVUP(rows, static_cast<size_t>(128)));
+       } else {
+-        scale_idx = global_scales_offset_Y * scale_stride_colwise + global_scales_offset_X;
++        if (transpose_colwise) {
++          // Transposed: write scales in [K, M/32] layout into the [M/32, K]-shaped buffer.
++          // Stride must match roundup(M/32, 4) to align with scale buffer allocation.
++          // MXFP8 block size is 32 elements.
++          const size_t transposed_stride = (rows + 31) / 32;
++          // Round up to multiple of 4 to match scale buffer inner dimension alignment.
++          const size_t rounded_stride = ((transposed_stride + 3) / 4) * 4;
++          scale_idx = global_scales_offset_X * rounded_stride + global_scales_offset_Y;
++        } else {
++          scale_idx = global_scales_offset_Y * scale_stride_colwise + global_scales_offset_X;
++        }
+       }
+       scales_colwise[scale_idx] = biased_exponent;
+ 
+       const float block_scale_inverse = ptx::exp2f_rcp(biased_exponent);
+       const ptx::floatx2 block_scale_inverse_2x = {block_scale_inverse, block_scale_inverse};
+ 
+-// 3. Scale elements
++// 3. Scale elements — write to shmem in original or transposed layout
+ #pragma unroll
+       for (int i = 0; i < SCALE_DIM_Y; ++i) {
+         float in;
+@@ -292,7 +310,7 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
+         }
+         const float scaled_out = in * block_scale_inverse;
+ 
+-        const size_t shmem_offset_elt = shmem_offset_base_colwise + i * BUFF_DIM_X;
++        const size_t shmem_offset_elt = buff * BUFF_DIM + colwise_out_base + i * colwise_out_stride;
+         out_colwise_data_sh[shmem_offset_elt] = static_cast<OType>(scaled_out);
+       }
+     }
+@@ -481,9 +499,13 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
+             global_offset_Y, reinterpret_cast<uint64_t *>(&out_rowwise_data_sh[buff_offset]));
+       }
+       if constexpr (COLWISE_SCALING) {
++        // When transpose_colwise: shmem is in [K, M] layout, TMA map describes [K, M] global,
++        // so swap coordinates: X=M_offset (was Y), Y=K_offset (was X)
++        const int colwise_tma_x = transpose_colwise ? global_offset_Y : global_offset_X;
++        const int colwise_tma_y = transpose_colwise ? global_offset_X : global_offset_Y;
+         ptx::cp_async_bulk_tensor_2d_shared_to_global(
+-            reinterpret_cast<const uint64_t *>(&tensor_map_output_colwise), global_offset_X,
+-            global_offset_Y, reinterpret_cast<uint64_t *>(&out_colwise_data_sh[buff_offset]));
++            reinterpret_cast<const uint64_t *>(&tensor_map_output_colwise), colwise_tma_x,
++            colwise_tma_y, reinterpret_cast<uint64_t *>(&out_colwise_data_sh[buff_offset]));
+       }
+ 
+       // Create a "bulk async-group" out of the previous bulk copy operation.
+@@ -732,9 +754,29 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop,
+                                      BUFF_DIM_Y, BUFF_DIM_X, cols, 0, output_type_bit_size);
+               }
+ 
++              // SM 12.0 MXFP8 fused transpose: write colwise output as [K, M] instead of [M, K].
++              // This eliminates the nvte_transpose call at GEMM time for the SM 12.0 TN fallback.
++              // Detect by checking if colwise buffer was allocated with transposed shape.
++              // SM 12.0 MXFP8 fused colwise transpose: write colwise data in [K, M] layout
++              // directly in the quantize kernel, eliminating nvte_transpose at GEMM time.
++              // Skip for square matrices (M==K) where shape-based detection is ambiguous.
++              const bool transpose_colwise_output =
++                  use_colwise_scaling && use_rowwise_scaling &&
++                  !nvte_is_non_tn_fp8_gemm_supported() &&
++                  (rows != cols);
++
+               if (use_colwise_scaling) {
+-                create_2D_tensor_map(tensor_map_output_colwise, output->columnwise_data, rows, cols,
+-                                     BUFF_DIM_Y, BUFF_DIM_X, cols, 0, output_type_bit_size);
++                if (transpose_colwise_output) {
++                  // Transposed TMA map: global [K, M], tile [BUFF_DIM_X K-rows, BUFF_DIM_Y M-cols]
++                  create_2D_tensor_map(tensor_map_output_colwise, output->columnwise_data,
++                                       cols, rows,  // global dims swapped: [K, M]
++                                       BUFF_DIM_X, BUFF_DIM_Y,  // tile swapped: [64 K, 32 M]
++                                       rows,  // stride = M
++                                       0, output_type_bit_size);
++                } else {
++                  create_2D_tensor_map(tensor_map_output_colwise, output->columnwise_data, rows, cols,
++                                       BUFF_DIM_Y, BUFF_DIM_X, cols, 0, output_type_bit_size);
++                }
+               }
+ 
+               constexpr size_t buff_elems = BUFF_DIM_Y * BUFF_DIM_X;
+@@ -786,7 +828,7 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop,
+                       tensor_map_input, tensor_map_act_input, tensor_map_output_rowwise,
+                       tensor_map_output_colwise, scales_rowwise_ptr, scales_colwise_ptr, noop_ptr,
+                       workspace_ptr, amax_ptr, rows, cols, scale_stride_rowwise,
+-                      scale_stride_colwise);
++                      scale_stride_colwise, false);
+                   NVTE_CHECK_CUDA(cudaGetLastError());
+                   break;
+                 }
+@@ -801,7 +843,7 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop,
+                       tensor_map_input, tensor_map_act_input, tensor_map_output_rowwise,
+                       tensor_map_output_colwise, scales_rowwise_ptr, scales_colwise_ptr, noop_ptr,
+                       workspace_ptr, amax_ptr, rows, cols, scale_stride_rowwise,
+-                      scale_stride_colwise);
++                      scale_stride_colwise, false);
+                   NVTE_CHECK_CUDA(cudaGetLastError());
+                   break;
+                 }
+@@ -816,7 +858,7 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop,
+                       tensor_map_input, tensor_map_act_input, tensor_map_output_rowwise,
+                       tensor_map_output_colwise, scales_rowwise_ptr, scales_colwise_ptr, noop_ptr,
+                       workspace_ptr, amax_ptr, rows, cols, scale_stride_rowwise,
+-                      scale_stride_colwise);
++                      scale_stride_colwise, transpose_colwise_output);
+                   NVTE_CHECK_CUDA(cudaGetLastError());
+                   break;
+                 }
+diff --git a/transformer_engine/common/gemm/cublaslt_gemm.cu b/transformer_engine/common/gemm/cublaslt_gemm.cu
+index 86cfdf52..c22abceb 100644
+--- a/transformer_engine/common/gemm/cublaslt_gemm.cu
++++ b/transformer_engine/common/gemm/cublaslt_gemm.cu
+@@ -181,11 +181,14 @@ GemmParam CanonicalizeGemmInput(const transformer_engine::Tensor &A, const cubla
+       // SM 12.0 (Blackwell consumer) only supports TN layout for MXFP8 GEMM.
+       // columnwise_data stores A^T in row-major order, so op_T on it gives A.
+       // This converts an NN or NT GEMM into TN layout with identical math result.
++      // Use A.scale_inv (rowwise, shape [m, k//32]) not A.columnwise_scale_inv ([m//32, k]):
++      // cuBLASLt MXFP8 TN GEMM expects scales indexed as scale[row][col//32] which
++      // matches rowwise layout when A is stored as [k×m] (columnwise_data) with CUBLAS_OP_T.
+       NVTE_CHECK(A.has_columnwise_data(), "Input A is missing column-wise usage");
+       ret.A = A.columnwise_data.dptr;
+       ret.transA = CUBLAS_OP_T;
+       ret.Atype = A.columnwise_data.dtype;
+-      ret.A_scale_inv = A.columnwise_scale_inv.dptr;
++      ret.A_scale_inv = A.scale_inv.dptr;
+       ret.lda = k;
+     } else {
+       if (is_A_transposed) {
+@@ -278,11 +281,14 @@ GemmParam CanonicalizeGemmInput(const transformer_engine::Tensor &A, const cubla
+       // SM 12.0 (Blackwell consumer) only supports TN layout for MXFP8 GEMM.
+       // columnwise_data stores B^T in row-major order, so op_N on it gives B^T already,
+       // converting a TT or NT GEMM into TN layout with identical math result.
++      // Use B.scale_inv (rowwise, shape [k, n//32]) not B.columnwise_scale_inv (shape
++      // [k//32, n]): cuBLASLt indexes MXFP8 scales as scale[row][col//32] for a [k×n]
++      // matrix, which matches the rowwise layout exactly.
+       NVTE_CHECK(B.has_columnwise_data(), "Input B is missing column-wise usage");
+       ret.B = B.columnwise_data.dptr;
+       ret.transB = CUBLAS_OP_N;
+       ret.Btype = B.columnwise_data.dtype;
+-      ret.B_scale_inv = B.columnwise_scale_inv.dptr;
++      ret.B_scale_inv = B.scale_inv.dptr;
+       ret.ldb = k;
+     } else {
+       if (is_B_transposed) {
+diff --git a/transformer_engine/pytorch/csrc/extensions/gemm.cpp b/transformer_engine/pytorch/csrc/extensions/gemm.cpp
+index 5cfaffe7..e465cc94 100644
+--- a/transformer_engine/pytorch/csrc/extensions/gemm.cpp
++++ b/transformer_engine/pytorch/csrc/extensions/gemm.cpp
+@@ -16,6 +16,7 @@
+ #include "common/util/system.h"
+ #include "pybind.h"
+ #include "transformer_engine/transformer_engine.h"
++#include "transformer_engine/transpose.h"
+ #include "util.h"
+ 
+ namespace {
+@@ -248,7 +249,7 @@ std::vector<py::object> gemm(py::handle A, bool transa, py::handle B, bool trans
+     if (is_mxfp8 && !nvte_is_non_tn_fp8_gemm_supported() && (!transa || transb)) {
+       auto transpose_mxfp8_operand = [&swizzled_scale_inverses_list](
+           TensorWrapper &tensor) {
+-        // Get columnwise data (same shape as original, NOT transposed for MXFP8)
++        // Get columnwise data (shape metadata says [M, K], same as original tensor)
+         auto col_data = tensor.get_columnwise_data();
+         auto col_scale = tensor.get_columnwise_scale_inv();
+ 
+@@ -259,17 +260,55 @@ std::vector<py::object> gemm(py::handle A, bool transa, py::handle B, bool trans
+         }
+         size_t last_dim = col_data.shape.data[col_data.shape.ndim - 1];
+ 
++        // On SM 12.0, the MXFP8 quantize kernel writes colwise data in transposed
++        // [K, M] layout directly (fused transpose). The data buffer has shape metadata
++        // [M, K] but physical layout is [K, M]. Skip for square matrices where M==K
++        // (transpose detection is ambiguous; falls back to explicit transpose).
++        // SM 12.0 fused colwise transpose: the MXFP8 quantize kernel writes colwise
++        // data in transposed [K, M] layout directly. The data buffer has shape metadata
++        // [M, K] but physical layout is [K, M]. Skip for square (M==K) matrices.
++        const bool already_transposed =
++            !nvte_is_non_tn_fp8_gemm_supported() && (first_dim != last_dim);
++
++        if (already_transposed) {
++          // Colwise data physically has [K, M] layout but metadata says [M, K].
++          // Swap dimensions when relabeling as rowwise — no transpose needed!
++          size_t scale_first = col_scale.shape.data[0];
++          size_t scale_last = col_scale.shape.data[1];
++          auto data_dtype = static_cast<DType>(col_data.dtype);
++          auto scale_dtype = static_cast<DType>(col_scale.dtype);
++
++          TensorWrapper new_tensor(NVTE_MXFP8_1D_SCALING);
++          new_tensor.set_rowwise_data(
++              col_data.data_ptr, data_dtype,
++              std::vector<size_t>{last_dim, first_dim});  // [K, M]
++          new_tensor.set_rowwise_scale_inv(
++              col_scale.data_ptr, scale_dtype,
++              std::vector<size_t>{scale_last, scale_first});  // transposed scales
++
++          tensor = std::move(new_tensor);
++          return;
++        }
++
++        // Fallback: explicit transpose (original path)
+         // Transpose data: [first_dim, last_dim] -> [last_dim, first_dim]
++        // Use TE's optimized nvte_transpose which uses vectorized loads/stores.
+         auto uint8_opts = at::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
+-        auto data_transposed = at::from_blob(
+-            col_data.data_ptr,
+-            {static_cast<int64_t>(first_dim), static_cast<int64_t>(last_dim)},
+-            uint8_opts).t().contiguous();
++        auto data_transposed = at::empty(
++            {static_cast<int64_t>(last_dim), static_cast<int64_t>(first_dim)}, uint8_opts);
++        {
++          // Create TE tensors for the transpose call
++          auto data_dtype = static_cast<DType>(col_data.dtype);
++          TensorWrapper input_tw, output_tw;
++          input_tw.set_rowwise_data(col_data.data_ptr, data_dtype,
++                                    std::vector<size_t>{first_dim, last_dim});
++          output_tw.set_rowwise_data(data_transposed.data_ptr(), data_dtype,
++                                     std::vector<size_t>{last_dim, first_dim});
++          auto stream = at::cuda::getCurrentCUDAStream().stream();
++          nvte_transpose(input_tw.data(), output_tw.data(), stream);
++        }
+ 
+-        // Transpose scale_inv
+-        // columnwise_scale_inv shape: [ceil(first_dim/32), last_dim_padded]
+-        // After transpose: [last_dim_padded, ceil(first_dim/32)]
+-        // This matches rowwise_scale_inv shape for data [last_dim, first_dim]
++        // Transpose scale_inv (small tensor, standard transpose is fine)
+         size_t scale_first = col_scale.shape.data[0];
+         size_t scale_last = col_scale.shape.data[1];
+         auto scale_transposed = at::from_blob(
