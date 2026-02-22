@@ -9,9 +9,10 @@ This is a fork of [alint77/nanogpt-fp8](https://github.com/alint77/nanogpt-fp8) 
 MXFP8BlockScaling was software-blocked on SM 12.0 in Transformer Engine, and the backward pass produced wrong gradients due to cuBLASLt's TN-only layout constraint for MXFP8 GEMM. This project:
 
 1. **Built PyTorch 2.11.0a0 + TE 2.13.0.dev from source** with CUDA 13.0 / SM 12.0 support
-2. **Patched TE** (4 files) to enable MXFP8 and fix backward pass correctness
-3. **Verified numerical accuracy**: MXFP8 weight gradient cosine = 0.999611 vs BF16
-4. **Benchmarked 4 recipes**: BF16, DelayedScaling, Float8BlockScaling, MXFP8BlockScaling
+2. **Patched TE** (3 files) to enable MXFP8 and fix backward pass correctness
+3. **Optimized MXFP8 transpose**: replaced PyTorch's generic copy kernel with TE's `nvte_transpose`, eliminating 43ms/step overhead
+4. **Verified numerical accuracy**: MXFP8 weight gradient cosine = 0.999611 vs BF16
+5. **Benchmarked 4 recipes**: BF16, DelayedScaling, Float8BlockScaling, MXFP8BlockScaling
 
 ## Benchmark Results (RTX 5090, 561M model, BS=4)
 
@@ -20,9 +21,9 @@ MXFP8BlockScaling was software-blocked on SM 12.0 in Transformer Engine, and the
 | BF16 (no FP8) | ~175 | ~39% | 1.00x |
 | DelayedScaling | ~124 | ~55% | 1.41x |
 | **Float8BlockScaling** | **~113** | **~61%** | **1.55x** |
-| MXFP8BlockScaling | ~159 | ~43% | 1.10x |
+| **MXFP8BlockScaling** | **~116** | **~59%** | **1.51x** |
 
-Float8BlockScaling is fastest because it pre-transposes columnwise data and pre-swizzles scales at quantization time. MXFP8's slower dual-quantization kernel is the bottleneck (not GEMM-time overhead).
+MXFP8 now matches Float8BlockScaling after the `nvte_transpose` optimization. The original 43ms gap was caused by PyTorch's generic `direct_copy_kernel_cuda` achieving only ~2% of peak bandwidth on 280 GB/step of uint8 backward transpose copies.
 
 See [report_complete.pdf](report_complete.pdf) for the full analysis.
 
@@ -182,12 +183,11 @@ nanogpt-fp8/
 
 ## What the TE Patch Does
 
-The patch modifies 4 files in Transformer Engine to enable MXFP8 on SM 12.0:
+The patch modifies 3 files in Transformer Engine to enable and optimize MXFP8 on SM 12.0:
 
 1. **`quantization.py`** — Removes the Python guard that blocked MXFP8 on SM >= 12.0
-2. **`gemm.cpp`** — Adds a 68-line transpose routine that converts MXFP8 non-TN GEMMs (backward dgrad NN, wgrad NT) to TN layout by transposing columnwise data `[M,K] -> [K,M]` and scales
+2. **`gemm.cpp`** — Adds a transpose routine that converts MXFP8 non-TN GEMMs (backward dgrad NN, wgrad NT) to TN layout by transposing columnwise data `[M,K] -> [K,M]` and scales. Uses TE's optimized `nvte_transpose` for near-peak memory bandwidth (replaces PyTorch's generic elementwise kernel which was ~50x slower)
 3. **`quantizer.cpp`** — Disables pre-swizzled scales on SM 12.0 so the gemm.cpp transpose gets natural-format scales to work with
-4. **`cublaslt_gemm.cu`** — Fixes the scale_inv pointer selection in the existing TN fallback (use rowwise scales, not columnwise)
 
 See [patches/README.md](patches/README.md) for detailed per-file documentation.
 
