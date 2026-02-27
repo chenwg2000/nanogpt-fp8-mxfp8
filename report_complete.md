@@ -466,8 +466,8 @@ Three parameters are configurable via environment variables for benchmarking wit
 
 ```python
 USE_FP8 = os.environ.get('USE_FP8', 'True').lower() != 'false'
-batch_size = int(os.environ.get('BATCH_SIZE', '3'))
-max_iters = int(os.environ.get('MAX_ITERS', '5000'))
+batch_size = int(os.environ.get('BATCH_SIZE', '4'))
+max_iters = int(os.environ.get('MAX_ITERS', '10'))
 ```
 
 ### 8.2 Recipe Selection via Environment
@@ -486,7 +486,7 @@ else:
     recipe = MXFP8BlockScaling()
 ```
 
-Usage: `RECIPE=Float8BlockScaling BATCH_SIZE=4 MAX_ITERS=50 bash run.sh`
+Usage: `RECIPE=Float8BlockScaling bash run.sh`
 
 ### 8.3 Optimizer: Muon to NorMuon
 
@@ -538,8 +538,8 @@ The gains/biases/embeddings learning rate was updated from `lr=2e-3` to `lr=0.2`
 | Change | Detail |
 |---|---|
 | Env var: `USE_FP8` | Toggle FP8 on/off for BF16 baseline |
-| Env var: `BATCH_SIZE` | Override micro-batch size (default 3) |
-| Env var: `MAX_ITERS` | Override optimizer steps (default 5000) |
+| Env var: `BATCH_SIZE` | Override micro-batch size (default 4) |
+| Env var: `MAX_ITERS` | Override optimizer steps (default 10) |
 | Env var: `RECIPE` | Select FP8 recipe (default MXFP8BlockScaling) |
 | Optimizer | Muon -> NorMuon with `weight_decay=0.01, cautious_wd=True` |
 | LR group 2 | `lr=2e-3` -> `lr=0.2` (NorMuon internally scales via rms_norm) |

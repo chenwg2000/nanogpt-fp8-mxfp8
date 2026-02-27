@@ -139,17 +139,17 @@ COSINE SIMILARITY of weight gradients vs BF16
 ### Step 7: Run Training
 
 ```bash
-# Default: MXFP8BlockScaling, BS=3
+# Default: MXFP8BlockScaling, BS=4
 bash run.sh
 
-# Float8BlockScaling, BS=4, 50 steps:
-RECIPE=Float8BlockScaling BATCH_SIZE=4 MAX_ITERS=50 bash run.sh
+# Float8BlockScaling:
+RECIPE=Float8BlockScaling bash run.sh
 
 # BF16 baseline:
-USE_FP8=false BATCH_SIZE=4 MAX_ITERS=50 bash run.sh
+USE_FP8=false bash run.sh
 
 # DelayedScaling:
-RECIPE=DelayedScaling BATCH_SIZE=4 MAX_ITERS=50 bash run.sh
+RECIPE=DelayedScaling bash run.sh
 ```
 
 ---
@@ -159,8 +159,8 @@ RECIPE=DelayedScaling BATCH_SIZE=4 MAX_ITERS=50 bash run.sh
 | Variable | Default | Description |
 |---|---|---|
 | `RECIPE` | `MXFP8BlockScaling` | FP8 recipe: `Float8BlockScaling`, `MXFP8BlockScaling`, `DelayedScaling` |
-| `BATCH_SIZE` | `3` | Micro-batch size per GPU |
-| `MAX_ITERS` | `5000` | Number of optimizer steps |
+| `BATCH_SIZE` | `4` | Micro-batch size per GPU |
+| `MAX_ITERS` | `10` | Number of optimizer steps |
 | `USE_FP8` | `True` | Set to `false` for BF16 baseline |
 
 ## Repository Structure

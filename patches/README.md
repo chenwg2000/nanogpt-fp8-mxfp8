@@ -88,17 +88,17 @@ git apply /path/to/nanogpt_fp8_changes.patch
 **Usage after applying:**
 
 ```bash
-# Default (MXFP8BlockScaling, BS=3):
+# Default (MXFP8BlockScaling, BS=4):
 bash run.sh
 
-# Float8BlockScaling, BS=4, 50 steps:
-RECIPE=Float8BlockScaling BATCH_SIZE=4 MAX_ITERS=50 bash run.sh
+# Float8BlockScaling:
+RECIPE=Float8BlockScaling bash run.sh
 
 # BF16 baseline (no FP8):
-USE_FP8=false BATCH_SIZE=4 MAX_ITERS=50 bash run.sh
+USE_FP8=false bash run.sh
 
 # DelayedScaling:
-RECIPE=DelayedScaling BATCH_SIZE=4 MAX_ITERS=50 bash run.sh
+RECIPE=DelayedScaling bash run.sh
 ```
 
 ---

@@ -39,9 +39,9 @@ WANDB_RUN_NAME = None  # Set to None for auto-generated name
 
 # hyperparameters
 total_batch_size = 512000 # total tokens per batch
-batch_size = int(os.environ.get('BATCH_SIZE', '3'))  # how many independent sequences will we process in parallel?
+batch_size = int(os.environ.get('BATCH_SIZE', '4'))  # how many independent sequences will we process in parallel?
 block_size = 2048 # what is the maximum context length for predictions?
-max_iters = int(os.environ.get('MAX_ITERS', '5000'))
+max_iters = int(os.environ.get('MAX_ITERS', '10'))
 learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 50

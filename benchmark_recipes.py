@@ -161,9 +161,9 @@ class DataLoader:
 
 # ── Model ─────────────────────────────────────────────────────────────────
 
-BATCH_SIZE = 3
+BATCH_SIZE = 4
 BLOCK_SIZE = 2048
-NUM_STEPS  = 50
+NUM_STEPS  = 10
 LR = 0.02
 GPU_PEAK_TFLOPS = 404  # RTX 5090 BF16
 
