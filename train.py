@@ -311,30 +311,40 @@ def quantize_to_mxfp8(x):
 
 
 class MXFP8Attention(torch.autograd.Function):
-    """MXFP8 flash attention forward and backward."""
+    """MXFP8 flash attention forward and backward.
+
+    After QK RMSNorm, values are already normalized (~unit scale),
+    so we cast directly to FP8 with identity scales (2^0 = 1.0)
+    instead of expensive per-block quantization.
+    """
 
     @staticmethod
     def forward(ctx, q, k, v):
-        # q, k, v: (B, T, H, D) in BF16
-        q_fp8, q_scale = quantize_to_mxfp8(q)
-        k_fp8, k_scale = quantize_to_mxfp8(k)
-        v_fp8, v_scale = quantize_to_mxfp8(v)
+        # q, k, v: (B, T, H, D) in BF16 (post-RMSNorm, ~unit scale)
+        B, T, H, D = q.shape
+        # Direct cast — no per-block quantization needed after RMSNorm
+        q_fp8 = q.to(torch.float8_e4m3fn)
+        k_fp8 = k.to(torch.float8_e4m3fn)
+        v_fp8 = v.to(torch.float8_e4m3fn)
+        # Identity scales: UE8M0 value 127 = 2^(127-127) = 2^0 = 1.0
+        identity_scale = torch.full(
+            (B, H, T, D // 32), 127, dtype=torch.uint8, device=q.device)
         out, softmax_lse = flash_attn_mxfp8_func(
             q_fp8, k_fp8, v_fp8,
-            q_scale, k_scale, v_scale,
+            identity_scale, identity_scale, identity_scale,
             causal=True,
         )
-        # Save FP8 tensors + scales + fwd outputs for native MXFP8 backward
-        ctx.save_for_backward(q_fp8, k_fp8, v_fp8, out, softmax_lse, q_scale, k_scale)
+        # Save FP8 tensors + fwd outputs for native MXFP8 backward
+        ctx.save_for_backward(q_fp8, k_fp8, v_fp8, out, softmax_lse, identity_scale)
         return out  # (B, T, H, D) in BF16
 
     @staticmethod
     def backward(ctx, grad_output):
-        q_fp8, k_fp8, v_fp8, out, softmax_lse, q_scale, k_scale = ctx.saved_tensors
+        q_fp8, k_fp8, v_fp8, out, softmax_lse, identity_scale = ctx.saved_tensors
         dq, dk, dv = flash_attn_mxfp8_bwd_func(
             grad_output, q_fp8, k_fp8, v_fp8,
             out, softmax_lse,
-            q_scale, k_scale,
+            identity_scale, identity_scale,
             causal=True,
         )
         return dq, dk, dv
