@@ -22,6 +22,14 @@ import torch.distributed as dist
 from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.device_mesh import init_device_mesh
 
+# MXFP8 Flash Attention imports
+import sys
+sys.path.insert(0, "/home/nanogpt/prj/fp8_flashattention/flash-attention/hopper")
+from flash_attn_interface import flash_attn_mxfp8_func, flash_attn_mxfp8_bwd_func
+from transformer_engine.pytorch.attention.rope import apply_rotary_pos_emb
+
+USE_MXFP8_FLASH_ATTN = os.environ.get('USE_MXFP8_ATTN', 'True').lower() != 'false'
+
 USE_FP8 = os.environ.get('USE_FP8', 'True').lower() != 'false'
 USE_NVFP4 = False
 USE_COMPILE_MODEL = False
@@ -276,6 +284,121 @@ def te_output_layer_init_method(weight):
     torch.nn.init.zeros_(weight)
 
 
+def quantize_to_mxfp8(x):
+    """Convert BF16 tensor (B, T, H, D) -> float8_e4m3fn data + uint8 UE8M0 scales.
+
+    Quantizes per 32-element block along the headdim dimension.
+    Scale convention: sf = floor(log2(amax)) + 127 (standard UE8M0).
+    Data is scaled by 2^(-floor(log2(amax))) so that fp8_data * 2^(sf-127) = original.
+    """
+    B, T, H, D = x.shape
+    # Reshape to blocks of 32 along headdim
+    x_blocks = x.reshape(B, T, H, D // 32, 32)
+    # Per-block amax
+    amax = x_blocks.abs().amax(dim=-1)  # (B, T, H, D//32)
+    amax = amax.clamp(min=1e-12)
+    # Shared exponent: floor(log2(amax))
+    exp = torch.floor(torch.log2(amax)).clamp(-10, 10).to(torch.int32)
+    # UE8M0 scale factor: exp + 127
+    shared_exp = (exp + 127).clamp(0, 255)
+    # Scale data by 2^(-exp) to normalize into ~[-1, 1] range for FP8
+    inv_scale = torch.exp2((-exp).to(torch.float32))
+    x_scaled = (x_blocks.float() * inv_scale.unsqueeze(-1)).clamp(-448, 448)
+    x_fp8 = x_scaled.reshape(B, T, H, D).to(torch.float8_e4m3fn)
+    # Scale tensor transposed to (B, H, T, D//32) as uint8
+    scale_uint8 = shared_exp.to(torch.uint8).permute(0, 2, 1, 3)  # (B, H, T, D//32)
+    return x_fp8, scale_uint8
+
+
+class MXFP8Attention(torch.autograd.Function):
+    """MXFP8 flash attention forward and backward."""
+
+    @staticmethod
+    def forward(ctx, q, k, v):
+        # q, k, v: (B, T, H, D) in BF16
+        q_fp8, q_scale = quantize_to_mxfp8(q)
+        k_fp8, k_scale = quantize_to_mxfp8(k)
+        v_fp8, v_scale = quantize_to_mxfp8(v)
+        out, softmax_lse = flash_attn_mxfp8_func(
+            q_fp8, k_fp8, v_fp8,
+            q_scale, k_scale, v_scale,
+            causal=True,
+        )
+        # Save FP8 tensors + scales + fwd outputs for native MXFP8 backward
+        ctx.save_for_backward(q_fp8, k_fp8, v_fp8, out, softmax_lse, q_scale, k_scale)
+        return out  # (B, T, H, D) in BF16
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        q_fp8, k_fp8, v_fp8, out, softmax_lse, q_scale, k_scale = ctx.saved_tensors
+        dq, dk, dv = flash_attn_mxfp8_bwd_func(
+            grad_output, q_fp8, k_fp8, v_fp8,
+            out, softmax_lse,
+            q_scale, k_scale,
+            causal=True,
+        )
+        return dq, dk, dv
+
+
+class Block(nn.Module):
+    """Custom transformer block using MXFP8 flash attention with TE linear layers."""
+
+    def __init__(self, hidden_size, ffn_hidden_size, num_attention_heads):
+        super().__init__()
+        self.head_dim = hidden_size // num_attention_heads
+        self.num_heads = num_attention_heads
+        # Attention sub-layer
+        self.qkv_proj = te.LayerNormLinear(
+            hidden_size, 3 * hidden_size,
+            normalization="RMSNorm",
+            bias=False,
+            init_method=te_init_method,
+        )
+        self.q_norm = te.RMSNorm(self.head_dim)
+        self.k_norm = te.RMSNorm(self.head_dim)
+        self.out_proj = te.Linear(
+            hidden_size, hidden_size,
+            bias=False,
+            init_method=te_output_layer_init_method,
+        )
+        # FFN sub-layer
+        self.mlp = te.LayerNormMLP(
+            hidden_size, ffn_hidden_size,
+            normalization="RMSNorm",
+            activation="srelu",
+            bias=False,
+            init_method=te_init_method,
+            output_layer_init_method=te_output_layer_init_method,
+        )
+
+    def forward(self, x, rotary_pos_emb=None, is_first_microbatch=None):
+        B, T, C = x.shape
+        # Attention sub-layer
+        residual = x
+        qkv = self.qkv_proj(x, is_first_microbatch=is_first_microbatch)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = q.reshape(B, T, self.num_heads, self.head_dim)
+        k = k.reshape(B, T, self.num_heads, self.head_dim)
+        v = v.reshape(B, T, self.num_heads, self.head_dim)
+        # RoPE first
+        if rotary_pos_emb is not None:
+            q = apply_rotary_pos_emb(q, rotary_pos_emb, tensor_format="bshd")
+            k = apply_rotary_pos_emb(k, rotary_pos_emb, tensor_format="bshd")
+        # QK RMSNorm after RoPE (matches TE default qk_norm_before_rope=False)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        # MXFP8 flash attention forward + BF16 SDPA backward
+        attn_out = MXFP8Attention.apply(q, k, v)
+        attn_out = attn_out.reshape(B, T, C)
+        attn_out = self.out_proj(attn_out, is_first_microbatch=is_first_microbatch)
+        x = residual + attn_out
+        # FFN sub-layer
+        residual = x
+        mlp_out = self.mlp(x, is_first_microbatch=is_first_microbatch)
+        x = residual + mlp_out
+        return x
+
+
 class LLM(nn.Module):
 
     def __init__(self):
@@ -287,27 +410,30 @@ class LLM(nn.Module):
             dim=n_embd // n_head,  # Apply RoPE to each attention head
             pretrained_max_position_embeddings=block_size
         )
-        self.blocks = nn.ModuleDict({f"block_{i}": te.TransformerLayer(
-            activation='srelu', 
-            attention_dropout=dropout, 
-            hidden_dropout=dropout, 
-            hidden_size=n_embd, 
-            ffn_hidden_size=4*n_embd, 
-            num_attention_heads=n_head,
-            attn_input_format='bshd',  # Critical: our input is (batch, seq, hidden)
-            bias=False,
-            qk_norm_type="RMSNorm", # L2 normalization degrades stability
-            normalization="RMSNorm",
-            fuse_qkv_params=True,
-            seq_length=block_size,
-            micro_batch_size=batch_size,
-            init_method=te_init_method,
-            output_layer_init_method=te_output_layer_init_method,
-            # set_parallel_mode=USE_FSDP,
-            # num_gqa_groups=n_head//2,
-            # fuse_wgrad_accumulation=True,
-            
-        ) for i in range(n_layer)}) 
+        if USE_MXFP8_FLASH_ATTN:
+            self.blocks = nn.ModuleDict({f"block_{i}": Block(
+                hidden_size=n_embd,
+                ffn_hidden_size=4*n_embd,
+                num_attention_heads=n_head,
+            ) for i in range(n_layer)})
+        else:
+            self.blocks = nn.ModuleDict({f"block_{i}": te.TransformerLayer(
+                activation='srelu',
+                attention_dropout=dropout,
+                hidden_dropout=dropout,
+                hidden_size=n_embd,
+                ffn_hidden_size=4*n_embd,
+                num_attention_heads=n_head,
+                attn_input_format='bshd',
+                bias=False,
+                qk_norm_type="RMSNorm",
+                normalization="RMSNorm",
+                fuse_qkv_params=True,
+                seq_length=block_size,
+                micro_batch_size=batch_size,
+                init_method=te_init_method,
+                output_layer_init_method=te_output_layer_init_method,
+            ) for i in range(n_layer)}) 
         self.ln_f = te.RMSNorm(n_embd) 
         self.lm_head = te.Linear(n_embd, vocab_size, bias=False)   
         # self.token_embedding_table.weight = self.lm_head.weight # tie weights
@@ -357,10 +483,14 @@ class LLM(nn.Module):
         x = self.token_embedding_table(idx) # (B,T,C)
         # pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
         for i in range(n_layer):
-            x = self.blocks[f"block_{i}"](x, rotary_pos_emb=rotary_pos_emb,
-                                          self_attn_mask_type="causal",
-                                          is_first_microbatch = is_first_microbatch,
-                                          checkpoint_core_attention=False)  # (B,T,C)
+            if USE_MXFP8_FLASH_ATTN:
+                x = self.blocks[f"block_{i}"](x, rotary_pos_emb=rotary_pos_emb,
+                                              is_first_microbatch=is_first_microbatch)
+            else:
+                x = self.blocks[f"block_{i}"](x, rotary_pos_emb=rotary_pos_emb,
+                                              self_attn_mask_type="causal",
+                                              is_first_microbatch=is_first_microbatch,
+                                              checkpoint_core_attention=False)
         x = self.ln_f(x) # (B,T,C)
 
         # Apply activation checkpointing to lm_head + loss if enabled
