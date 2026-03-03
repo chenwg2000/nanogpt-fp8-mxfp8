@@ -29,41 +29,110 @@ Comparison on NVIDIA RTX 5090 (SM 12.0, Blackwell consumer)
 > (`dot_product_attention/utils.py` line ~511). All TE paths use BF16 SDPA for attention.
 > FP8 is only applied to linear layers (QKV projection, output projection, MLP).
 
-## Evolution of the MXFP8 Attention Path
+## 1. Precision Analysis
 
-The custom MXFP8 attention path went through three iterations:
+### Custom MXFP8 Block — per-stage precision
 
-### v1: MXFP8 fwd + BF16 SDPA bwd (with Python quantization)
-- **145 ms/iter, 47% MFU, final loss 7.08**
-- BF16 SDPA backward recompute: 0.95 ms/layer
-- Python `quantize_to_mxfp8`: 0.50 ms/layer
-- Fwd/bwd precision mismatch caused loss spikes (8.1 → 11.7) and poor convergence
+```
+Input (BF16)
+  │
+  ├─ Self-Attention Sub-layer
+  │   ├─ QKV Projection (te.LayerNormLinear)
+  │   │     RMSNorm:         BF16 → BF16
+  │   │     GEMM:            E4M3 × E4M3 → FP32 accumulate (split acc) → BF16
+  │   ├─ RoPE (Q, K)         BF16 → BF16  (separate kernel)
+  │   ├─ QK RMSNorm (Q, K)   BF16 → BF16  (separate kernel)
+  │   ├─ FP8 Cast (Q, K, V)  BF16 → E4M3 FP8 (direct cast, identity scales UE8M0=127)
+  │   ├─ MXFP8 Flash Attention
+  │   │     Q × K^T:         E4M3 × E4M3 → FP32 accumulate
+  │   │     Softmax:          FP32
+  │   │     P × V:            E4M3 × E4M3 → FP32 accumulate → BF16 output
+  │   ├─ Output Projection (te.Linear)
+  │   │     GEMM:            E4M3 × E4M3 → FP32 accumulate → BF16
+  │   └─ Residual Add        BF16
+  │
+  ├─ MLP Sub-layer (te.LayerNormMLP)
+  │   ├─ RMSNorm              BF16 → BF16
+  │   ├─ FC1 GEMM             E4M3 × E4M3 → FP32 accumulate → BF16
+  │   ├─ SReLU                BF16
+  │   ├─ FC2 GEMM             E4M3 × E4M3 → FP32 accumulate → BF16
+  │   └─ Residual Add         BF16
+  │
+Output (BF16)
+```
 
-### v2: Native MXFP8 fwd + bwd (with Python quantization)
-- **135 ms/iter, 51% MFU**
-- Native backward kernel eliminated BF16 SDPA recompute
-- Fixed fwd/bwd precision mismatch — convergence stable
-- Scale convention bug fixed (sf = exp+127, not exp+119)
-- Python quantization still costing 0.50 ms/layer
+### TE Baseline — per-stage precision
 
-### v3: Native MXFP8 fwd + bwd (direct FP8 cast, no quantization)
-- **129 ms/iter, 53% MFU, final loss 6.11**
-- After QK RMSNorm, values are ~unit scale — direct `.to(float8_e4m3fn)` with
-  identity scales (UE8M0=127=2^0) works as well as per-block quantization
-- Eliminated 0.50 ms/layer Python quantization overhead
+```
+Input (BF16)
+  │
+  ├─ Self-Attention Sub-layer (te.TransformerLayer)
+  │   ├─ QKV Projection
+  │   │     RMSNorm:         BF16 → BF16
+  │   │     GEMM:            E4M3 × E4M3 → FP32 accumulate (split acc) → BF16
+  │   ├─ RoPE (Q, K)         BF16 → BF16  (fused into attention module)
+  │   ├─ QK RMSNorm (Q, K)   BF16 → BF16  (fused into attention module)
+  │   ├─ BF16 Attention (UnfusedDotProductAttention, FP8 disabled on SM 12.0)
+  │   │     Q × K^T:         BF16 × BF16 → BF16
+  │   │     Softmax:          BF16
+  │   │     P × V:            BF16 × BF16 → BF16
+  │   ├─ Output Projection
+  │   │     GEMM:            E4M3 × E4M3 → FP32 accumulate → BF16
+  │   └─ Residual Add        BF16
+  │
+  ├─ MLP Sub-layer
+  │   ├─ RMSNorm              BF16 → BF16
+  │   ├─ FC1 GEMM             E4M3 × E4M3 → FP32 accumulate → BF16
+  │   ├─ SReLU                BF16
+  │   ├─ FC2 GEMM             E4M3 × E4M3 → FP32 accumulate → BF16
+  │   └─ Residual Add         BF16
+  │
+Output (BF16)
+```
 
-## 1. Training Throughput (Latest: v3)
+### Key precision differences
+
+| Component | Custom MXFP8 Block | TE Baseline |
+|---|---|---|
+| Attention Q × K^T | **E4M3 × E4M3 → FP32** | BF16 × BF16 → BF16 |
+| Softmax | **FP32** | BF16 |
+| Attention P × V | **E4M3 × E4M3 → FP32** | BF16 × BF16 → BF16 |
+| Attention backward | **E4M3 FP8 GEMMs** | BF16 (autograd) |
+| FP8 GEMMs per layer (fwd) | **6** (4 linear + 2 attn) | **4** (linear only) |
+| FP8 GEMMs per layer (bwd) | **12** (8 linear + 4 attn) | **8** (linear only) |
+| Linear layers | Identical | Identical |
+| RMSNorm, RoPE, activations | Identical (BF16) | Identical (BF16) |
+
+The custom path uses FP8 for **all 18 GEMMs per layer** (fwd+bwd), while TE uses FP8 for
+only 12 (linear layers only). Notably, the custom path computes softmax in FP32 (vs TE's
+BF16), giving higher numerical stability in attention despite lower-precision inputs.
+
+## 2. Evolution of the MXFP8 Attention Path
+
+| Version | Changes | Iter time | MFU | Final loss |
+|---|---|---|---|---|
+| v1 | MXFP8 fwd + BF16 SDPA bwd, Python quantization | 145 ms | 47% | 7.08 |
+| v2 | Native MXFP8 fwd+bwd, Python quantization | 135 ms | 51% | — |
+| v3 | Native fwd+bwd, direct FP8 cast (no quantization) | 129 ms | 53% | 6.11 |
+| **v3+** | **v3 + updated flash-attn library** | **115 ms** | **59%** | **6.11** |
+
+Key fixes at each stage:
+- **v1→v2**: Native backward kernel fixed fwd/bwd precision mismatch (loss spikes eliminated)
+- **v1→v2**: Scale convention fix (sf = exp+127, not exp+119) fixed NaN gradients
+- **v2→v3**: Direct FP8 cast eliminated 0.50 ms/layer Python quantization overhead
+- **v3→v3+**: Updated flash-attention library optimized kernel performance
+
+## 3. Training Throughput (Latest: v3+)
 
 | Config | Avg iter time | MFU | Speedup vs BF16 |
 |:---|---:|---:|---:|
-| TE + MXFP8BlockScaling | 111 ms | 61% | **1.61x** |
-| MXFP8 + MXFP8 Attention (v3) | 129 ms | 53% | **1.39x** |
+| TE + MXFP8BlockScaling | 113 ms | 61% | **1.58x** |
+| **MXFP8 + MXFP8 Attention (v3+)** | **115 ms** | **59%** | **1.56x** |
 | BF16 baseline | 179 ms | 38% | 1.00x |
 
-The remaining 18 ms gap (129 vs 111 ms) is from unfused RoPE and QK RMSNorm kernels.
-TE fuses these into its attention module; the custom Block runs them as separate CUDA kernels.
+The gap between MXFP8 attention and TE baseline is now **~2 ms** (~115 vs ~113 ms).
 
-## 2. Training Convergence (50 steps, v3 vs TE baseline)
+## 4. Training Convergence (50 steps)
 
 ### Loss curve
 
@@ -88,7 +157,7 @@ Step  MXFP8 Attn (v3)   TE MXFP8
 
 ### Key metrics
 
-| Metric | MXFP8 Attn (v3) | TE MXFP8 |
+| Metric | MXFP8 Attn | TE MXFP8 |
 |:---|---:|---:|
 | Final train loss | 6.107 | 6.045 |
 | Val loss @40 | 6.298 | 6.327 |
@@ -97,50 +166,69 @@ Step  MXFP8 Attn (v3)   TE MXFP8
 Convergence is essentially identical. Both paths reach ~6.1 final loss with stable
 gradient norms settling to ~0.13 by step 49. No loss spikes or instability.
 
-## 3. Operator-Level Analysis
+## 5. Per-Layer Operator Breakdown
 
-Per-layer timing breakdown from `benchmark_attention.py` (CUDA event timing, 20 runs).
-Note: these timings are from the v1 architecture; v3 eliminates the quantize_to_mxfp8 cost.
+From `benchmark_breakdown.py` (CUDA event timing, 10 runs):
 
-### Custom MXFP8 Block — forward pass operators
+### Custom MXFP8 Block
 
-| Operator | Time (ms) | % of fwd | Status in v3 |
-|:---|---:|---:|:---|
-| LayerNormMLP (RMSNorm + FC1 + SReLU + FC2) | 0.59 | 32.0% | unchanged |
-| ~~`quantize_to_mxfp8` × 3~~ | ~~0.53~~ | ~~28.5%~~ | **eliminated** (direct cast) |
-| QKV proj (LayerNormLinear, FP8 GEMM) | 0.26 | 14.3% | unchanged |
-| RoPE × 2 | 0.25 | 13.7% | unchanged |
-| `flash_attn_mxfp8` kernel | 0.21 | 11.4% | unchanged |
-| Output proj (te.Linear, FP8 GEMM) | 0.16 | 8.4% | unchanged |
-| QK RMSNorm × 2 | 0.10 | 5.4% | unchanged |
-| Residual adds × 2 | 0.02 | 1.3% | unchanged |
+| Operator | Fwd (ms) | Bwd (ms) | Total (ms) |
+|:---|---:|---:|---:|
+| QKV proj (te.LayerNormLinear) | 0.27 | 0.41 | 0.68 |
+| RoPE + QK RMSNorm | 0.29 | — | 0.29 |
+| FP8 cast (Q,K,V) | 0.04 | — | 0.04 |
+| MXFP8 Attention kernel | 0.20 | 0.78 | 0.98 |
+| Output proj (te.Linear) | 0.16 | 0.32 | 0.48 |
+| MLP (te.LayerNormMLP) | 0.53 | 0.97 | 1.50 |
+| **Total** | **1.48** | **2.49** | **3.97** |
 
-### Head-to-head kernel comparisons
+Category breakdown:
+- **Linear layers** (QKV + OutProj + MLP): 2.66 ms (67%)
+- **Attention** (RoPE + Norm + Cast + Kernel): 1.31 ms (33%)
 
-| Test | Time (ms) | Ratio |
-|:---|---:|---:|
-| MXFP8 flash attn fwd | 0.21 | 0.74x (26% faster) |
-| BF16 SDPA fwd | 0.29 | 1.00x |
+### TE Baseline
 
-The MXFP8 flash attention kernel is 26% faster than BF16 SDPA in isolation.
+| Operator | Fwd (ms) | Bwd (ms) | Total (ms) |
+|:---|---:|---:|---:|
+| Self-Attention (fused: LN+QKV+RoPE+Norm+SDPA+OutProj) | 0.72 | 1.44 | 2.16 |
+| MLP (LayerNormMLP) | 0.53 | 1.11 | 1.64 |
+| **Total** | **1.25** | **2.55** | **3.80** |
 
-## 4. Root Cause: Remaining 18ms Gap
+### Side-by-side
 
-The 18 ms/iter gap between MXFP8 attention (129ms) and TE baseline (111ms) comes from
-**kernel fusion**, not precision conversion overhead:
+| Component | MXFP8 Attn | TE Baseline | Delta |
+|:---|---:|---:|---:|
+| Attention sub-layer | 2.47 ms | 2.16 ms | +0.31 ms |
+| MLP sub-layer | 1.50 ms | 1.64 ms | -0.14 ms |
+| **Layer total** | **3.97 ms** | **3.80 ms** | **+0.17 ms** |
 
-| Source | Estimated cost | Notes |
-|:---|---:|:---|
-| RoPE × 2 (separate kernels) | ~0.25 ms/layer | TE fuses into attention |
-| QK RMSNorm × 2 (separate kernels) | ~0.10 ms/layer | TE fuses into attention |
-| Flash attn kernel dispatch overhead | ~0.05 ms/layer | vs TE's integrated SDPA |
-| **Total per layer** | **~0.40 ms** | |
-| **Total for 20 layers** | **~8 ms** | |
+The per-layer gap is only 0.17 ms, coming from unfused RoPE + QK RMSNorm (0.29 ms as
+separate kernels, partially offset by a faster MLP in the custom path).
 
-The remaining ~10ms is likely from backward pass differences (TE's fused backward vs
-our separate backward kernels for each operator).
+## 6. Flash Attention GEMM Dimensions
 
-## 5. Key Technical Decisions
+For training config B=4, T=2048, H=10, D=128 (40 independent heads):
+
+### Forward (per head)
+
+| GEMM | Operation | Dimensions (M × N × K) | Precision |
+|---|---|---|---|
+| S = Q × K^T | Attention scores | 2048 × 2048 × 128 | E4M3 × E4M3 → FP32 |
+| O = softmax(S) × V | Attention output | 2048 × 128 × 2048 | E4M3 × E4M3 → FP32 → BF16 |
+
+### Backward (per head)
+
+| GEMM | Operation | Dimensions (M × N × K) |
+|---|---|---|
+| dS = dO × V^T | Score gradients | 2048 × 2048 × 128 |
+| dQ = dS × K | Query gradients | 2048 × 128 × 2048 |
+| dK = dS^T × Q | Key gradients | 2048 × 128 × 2048 |
+| dV = P^T × dO | Value gradients | 2048 × 128 × 2048 |
+
+All tiled (flash attention never materializes the full 2048×2048 matrix).
+Causal masking roughly halves the effective work.
+
+## 7. Key Technical Decisions
 
 ### Scale convention fix (v2)
 Our original `quantize_to_mxfp8` used `sf = floor(log2(amax)) + 119` (offset by -8 for
@@ -160,20 +248,21 @@ FP32, then cast to BF16). FP8 output would lose too much precision for residual 
 The subsequent `te.Linear` output projection handles its own BF16→FP8 quantization internally
 with fused CUDA kernels.
 
-## 6. Summary
+## 8. Summary
 
-| Rank | Config | Iter time | MFU | Final loss |
-|---|---|---:|---:|---:|
-| 1 | TE + MXFP8BlockScaling | 111 ms | 61% | 6.045 |
-| 2 | MXFP8 + MXFP8 Attention (v3) | 129 ms | 53% | 6.107 |
-| 3 | BF16 baseline | 179 ms | 38% | 6.017 |
+| Rank | Config | Iter time | MFU | Final loss | FP8 GEMMs/layer |
+|---|---|---:|---:|---:|---:|
+| 1 | TE + MXFP8BlockScaling | 113 ms | 61% | 6.045 | 12 |
+| 2 | MXFP8 + MXFP8 Attention (v3+) | 115 ms | 59% | 6.107 | 18 |
+| 3 | BF16 baseline | 179 ms | 38% | 6.017 | 0 |
 
 ### Recommendation
 
-**MXFP8 attention with native fwd+bwd kernels and direct FP8 cast** is now viable for
-training on SM 12.0. It achieves 1.39x speedup over BF16 with matching convergence quality
-(6.11 vs 6.05 final loss). The TE baseline remains 16% faster (111 vs 129 ms) due to
-kernel fusion advantages, not precision conversion overhead.
+**MXFP8 attention with native fwd+bwd kernels** is now at near-parity with the TE baseline
+on SM 12.0 (115 ms vs 113 ms, 59% vs 61% MFU) with matching convergence (6.11 vs 6.05).
+It uses FP8 for all 18 GEMMs per layer (vs TE's 12), with FP32 softmax providing higher
+intermediate precision than TE's BF16 softmax.
 
-The remaining gap could be closed by fusing RoPE + QK RMSNorm into the attention kernel
-or using a custom fused pre-attention kernel.
+The remaining ~2 ms gap is from unfused RoPE + QK RMSNorm kernels. A fused kernel
+(see `spec_fused_mxfp8_attention.md`) that incorporates these ops into the flash attention
+prologue would close this gap entirely and potentially surpass the TE baseline.
