@@ -380,6 +380,17 @@ class Block(nn.Module):
             init_method=te_init_method,
             output_layer_init_method=te_output_layer_init_method,
         )
+        # Compile RoPE + QK Norm into fused kernel
+        self._pre_attention = torch.compile(self._pre_attention)
+
+    def _pre_attention(self, q, k, v, rotary_pos_emb):
+        """RoPE + QK RMSNorm + FP8 cast — compiled into a fused kernel."""
+        if rotary_pos_emb is not None:
+            q = apply_rotary_pos_emb(q, rotary_pos_emb, tensor_format="bshd")
+            k = apply_rotary_pos_emb(k, rotary_pos_emb, tensor_format="bshd")
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        return q, k, v
 
     def forward(self, x, rotary_pos_emb=None, is_first_microbatch=None):
         B, T, C = x.shape
@@ -390,14 +401,9 @@ class Block(nn.Module):
         q = q.reshape(B, T, self.num_heads, self.head_dim)
         k = k.reshape(B, T, self.num_heads, self.head_dim)
         v = v.reshape(B, T, self.num_heads, self.head_dim)
-        # RoPE first
-        if rotary_pos_emb is not None:
-            q = apply_rotary_pos_emb(q, rotary_pos_emb, tensor_format="bshd")
-            k = apply_rotary_pos_emb(k, rotary_pos_emb, tensor_format="bshd")
-        # QK RMSNorm after RoPE (matches TE default qk_norm_before_rope=False)
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-        # MXFP8 flash attention forward + BF16 SDPA backward
+        # Fused RoPE + QK RMSNorm
+        q, k, v = self._pre_attention(q, k, v, rotary_pos_emb)
+        # MXFP8 flash attention forward and backward
         attn_out = MXFP8Attention.apply(q, k, v)
         attn_out = attn_out.reshape(B, T, C)
         attn_out = self.out_proj(attn_out, is_first_microbatch=is_first_microbatch)
