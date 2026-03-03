@@ -284,32 +284,6 @@ def te_output_layer_init_method(weight):
     torch.nn.init.zeros_(weight)
 
 
-def quantize_to_mxfp8(x):
-    """Convert BF16 tensor (B, T, H, D) -> float8_e4m3fn data + uint8 UE8M0 scales.
-
-    Quantizes per 32-element block along the headdim dimension.
-    Scale convention: sf = floor(log2(amax)) + 127 (standard UE8M0).
-    Data is scaled by 2^(-floor(log2(amax))) so that fp8_data * 2^(sf-127) = original.
-    """
-    B, T, H, D = x.shape
-    # Reshape to blocks of 32 along headdim
-    x_blocks = x.reshape(B, T, H, D // 32, 32)
-    # Per-block amax
-    amax = x_blocks.abs().amax(dim=-1)  # (B, T, H, D//32)
-    amax = amax.clamp(min=1e-12)
-    # Shared exponent: floor(log2(amax))
-    exp = torch.floor(torch.log2(amax)).clamp(-10, 10).to(torch.int32)
-    # UE8M0 scale factor: exp + 127
-    shared_exp = (exp + 127).clamp(0, 255)
-    # Scale data by 2^(-exp) to normalize into ~[-1, 1] range for FP8
-    inv_scale = torch.exp2((-exp).to(torch.float32))
-    x_scaled = (x_blocks.float() * inv_scale.unsqueeze(-1)).clamp(-448, 448)
-    x_fp8 = x_scaled.reshape(B, T, H, D).to(torch.float8_e4m3fn)
-    # Scale tensor transposed to (B, H, T, D//32) as uint8
-    scale_uint8 = shared_exp.to(torch.uint8).permute(0, 2, 1, 3)  # (B, H, T, D//32)
-    return x_fp8, scale_uint8
-
-
 class MXFP8Attention(torch.autograd.Function):
     """MXFP8 flash attention forward and backward.
 
@@ -380,17 +354,6 @@ class Block(nn.Module):
             init_method=te_init_method,
             output_layer_init_method=te_output_layer_init_method,
         )
-        # Compile RoPE + QK Norm into fused kernel
-        self._pre_attention = torch.compile(self._pre_attention)
-
-    def _pre_attention(self, q, k, v, rotary_pos_emb):
-        """RoPE + QK RMSNorm + FP8 cast — compiled into a fused kernel."""
-        if rotary_pos_emb is not None:
-            q = apply_rotary_pos_emb(q, rotary_pos_emb, tensor_format="bshd")
-            k = apply_rotary_pos_emb(k, rotary_pos_emb, tensor_format="bshd")
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-        return q, k, v
 
     def forward(self, x, rotary_pos_emb=None, is_first_microbatch=None):
         B, T, C = x.shape
@@ -401,8 +364,12 @@ class Block(nn.Module):
         q = q.reshape(B, T, self.num_heads, self.head_dim)
         k = k.reshape(B, T, self.num_heads, self.head_dim)
         v = v.reshape(B, T, self.num_heads, self.head_dim)
-        # Fused RoPE + QK RMSNorm
-        q, k, v = self._pre_attention(q, k, v, rotary_pos_emb)
+        # RoPE + QK RMSNorm (separate kernels, autograd handles backward)
+        if rotary_pos_emb is not None:
+            q = apply_rotary_pos_emb(q, rotary_pos_emb, tensor_format="bshd")
+            k = apply_rotary_pos_emb(k, rotary_pos_emb, tensor_format="bshd")
+        q = self.q_norm(q)
+        k = self.k_norm(k)
         # MXFP8 flash attention forward and backward
         attn_out = MXFP8Attention.apply(q, k, v)
         attn_out = attn_out.reshape(B, T, C)
