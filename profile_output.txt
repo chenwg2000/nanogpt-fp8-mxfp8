@@ -1,0 +1,136 @@
+grad_accum_steps = 63
+batch_size = 4, block_size = 2048
+n_layer = 20, n_embd = 1280, n_head = 10
+561.0M parameters
+Training DataLoader: 900000000 tokens across 9 files
+
+================================================================================
+PHASE 1: CUDA Event Training Loop Breakdown
+================================================================================
+  Warmup steps: 3, Timed steps: 10
+  grad_accum_steps: 63
+  micro-batch shape: (4, 2048)
+
+/home/nanogpt/pytorch/torch/_dynamo/variables/functions.py:2201: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function at '_common.py:45'. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS=+dynamo for a DEBUG stack trace.
+
+This call originates from:
+  File "/home/nanogpt/te/TransformerEngine/transformer_engine/pytorch/ops/_common.py", line 45, in maybe_autocast_dtype
+    if torch_version() >= (2, 4, 3):
+
+  torch._dynamo.utils.warn_once(msg)
+/home/nanogpt/pytorch/torch/_dynamo/variables/functions.py:2082: UserWarning: Dynamo does not know how to trace the builtin `transformer_engine_torch.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.rmsnorm_fwd.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+  torch._dynamo.utils.warn_once(explanation + "\n" + "\n".join(hints))
+  [WARMUP] step 0: loss = 11.0625
+  [WARMUP] step 1: loss = 10.3300
+  [WARMUP] step 2: loss = 9.5716
+  [TIMED] step 3: loss = 9.7007
+  [TIMED] step 4: loss = 8.2381
+  [TIMED] step 5: loss = 8.0171
+  [TIMED] step 6: loss = 8.0276
+  [TIMED] step 7: loss = 7.4802
+  [TIMED] step 8: loss = 7.3813
+  [TIMED] step 9: loss = 7.4520
+  [TIMED] step 10: loss = 6.7939
+  [TIMED] step 11: loss = 7.0523
+  [TIMED] step 12: loss = 6.8656
+
+----------------------------------------------------------------------
+Per Micro-Batch Breakdown (averaged over timed steps)
+----------------------------------------------------------------------
+  data_load             mean=   0.363 ms  std=  0.107 ms  min=   0.039 ms  max=   1.686 ms
+  forward               mean=  34.416 ms  std=  4.611 ms  min=  33.006 ms  max= 148.198 ms
+  loss_scale            mean=   0.003 ms  std=  0.001 ms  min=   0.002 ms  max=   0.014 ms
+  backward              mean=  77.146 ms  std=  1.519 ms  min=  70.809 ms  max=  84.290 ms
+  micro_batch_total     mean= 111.929 ms  std=  4.921 ms  min= 106.383 ms  max= 228.291 ms
+
+----------------------------------------------------------------------
+Per Optimizer Step Breakdown (averaged over timed steps)
+----------------------------------------------------------------------
+  grad_clip             mean=   5.288 ms  std=  0.324 ms  min=   5.082 ms  max=   6.240 ms
+  optimizer_step        mean=  98.482 ms  std=  1.055 ms  min=  96.974 ms  max= 100.006 ms
+  zero_grad             mean=   0.000 ms  std=  0.000 ms  min=   0.000 ms  max=   0.000 ms
+  full_step_wall        mean=7161.880 ms  std= 38.657 ms  min=7135.116 ms  max=7273.269 ms
+
+  Estimated iter time (full_step / 63):
+    mean = 113.68 ms   (compare to ~114 ms actual)
+    min  = 113.26 ms
+    max  = 115.45 ms
+
+
+================================================================================
+PHASE 2: PyTorch Profiler (1 warmup step + 1 profiled step)
+================================================================================
+
+  Warmup step: loss = 6.3256
+  Profiling 1 optimizer step...
+/home/nanogpt/pytorch/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+  Profiled step: loss = 6.3596
+
+----------------------------------------------------------------------
+Top 30 CUDA Kernels by cuda_time_total
+----------------------------------------------------------------------
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                        DistributedDataParallel.forward         0.00%       0.000us         0.00%       0.000us       0.000us        2.549s        37.29%        2.549s      40.460ms            63  
+cutlass3x_sm120_bstensorop_s16832gemm_block_scaled_u...         0.00%       0.000us         0.00%       0.000us       0.000us        2.265s        33.14%        2.265s     147.959us         15309  
+                        DistributedDataParallel.forward         2.83%     237.674ms        22.53%        1.893s      30.042ms       0.000us         0.00%        2.024s      32.127ms            63  
+autograd::engine::evaluate_function: _LayerNormMLPBa...         0.25%      20.626ms         6.99%     587.115ms     465.964us       0.000us         0.00%        1.357s       1.077ms          1260  
+                                  _LayerNormMLPBackward         3.77%     316.609ms         6.10%     512.179ms     406.491us        1.188s        17.38%        1.188s     942.807us          1260  
+autograd::engine::evaluate_function: MXFP8AttentionB...         0.11%       8.923ms         2.55%     213.919ms     169.777us       0.000us         0.00%        1.019s     808.992us          1260  
+                                 MXFP8AttentionBackward         0.23%      19.187ms         2.44%     204.996ms     162.695us       0.000us         0.00%        1.019s     808.992us          1260  
+                                flash_attn_3::bwd_mxfp8         0.23%      19.727ms         2.21%     185.809ms     147.467us        1.019s        14.91%        1.019s     808.992us          1260  
+void cutlass::device_kernel<flash::enable_sm120_or_l...         0.00%       0.000us         0.00%       0.000us       0.000us     827.206ms        12.10%     827.206ms     656.513us          1260  
+                                            aten::copy_         1.02%      85.959ms        36.25%        3.045s     106.262us     588.809ms         8.61%     588.819ms      20.547us         28657  
+                                          _LayerNormMLP         2.57%     215.616ms         3.86%     324.290ms     257.373us     569.566ms         8.33%     586.801ms     465.715us          1260  
+                                               aten::to         0.24%      19.757ms        37.71%        3.168s     109.988us       0.000us         0.00%     583.760ms      20.269us         28801  
+                                         aten::_to_copy         0.70%      59.173ms        37.47%        3.148s     115.596us       0.000us         0.00%     583.760ms      21.436us         27233  
+autograd::engine::evaluate_function: _LayerNormLinea...         0.21%      17.764ms         5.18%     435.329ms     345.499us       0.000us         0.00%     559.790ms     444.278us          1260  
+autograd::engine::evaluate_function: _LinearBackward...         0.10%       8.382ms         5.65%     474.480ms     358.640us       0.000us         0.00%     533.322ms     403.116us          1323  
+                                        _LinearBackward         2.21%     185.456ms         5.38%     451.929ms     341.594us     505.225ms         7.39%     507.514ms     383.609us          1323  
+                               _LayerNormLinearBackward         2.44%     205.401ms         3.38%     284.137ms     225.505us     448.652ms         6.56%     448.652ms     356.073us          1260  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     392.979ms         5.75%     392.979ms      31.125us         12626  
+                                             aten::add_         0.40%      33.750ms         1.29%     108.572ms       8.599us     392.909ms         5.75%     392.909ms      31.119us         12626  
+void transformer_engine::dispatch::mxfp8::quantize_k...         0.00%       0.000us         0.00%       0.000us       0.000us     308.320ms         4.51%     308.320ms      40.114us          7686  
+void at::native::unrolled_elementwise_kernel<at::nat...         0.00%       0.000us         0.00%       0.000us       0.000us     305.069ms         4.46%     305.069ms      23.737us         12852  
+                                         MXFP8Attention         0.40%      33.856ms         1.47%     123.106ms      97.703us       0.000us         0.00%     293.821ms     233.191us          1260  
+autograd::engine::evaluate_function: torch::autograd...         0.31%      26.171ms         1.61%     135.640ms      13.209us       0.000us         0.00%     245.415ms      23.899us         10269  
+                        torch::autograd::AccumulateGrad         0.16%      13.483ms         1.26%     105.701ms      10.293us       0.000us         0.00%     243.714ms      23.733us         10269  
+                                flash_attn_3::fwd_mxfp8         0.18%      15.331ms         0.35%      29.099ms      23.094us     241.929ms         3.54%     241.929ms     192.007us          1260  
+void cutlass::device_kernel<flash::enable_sm120_or_l...         0.00%       0.000us         0.00%       0.000us       0.000us     241.929ms         3.54%     241.929ms     192.007us          1260  
+                               aten::cross_entropy_loss         0.00%     317.658us         0.05%       3.821ms      60.653us       0.000us         0.00%     237.824ms       3.775ms            63  
+                                                _Linear         1.63%     136.754ms         2.08%     174.903ms     132.202us     233.224ms         3.41%     233.283ms     176.329us          1323  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     227.416ms         3.33%     227.416ms      22.011us         10332  
+                                       _LayerNormLinear         1.74%     146.208ms         2.65%     222.276ms     176.409us     196.029ms         2.87%     210.524ms     167.082us          1260  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 8.401s
+Self CUDA time total: 6.836s
+
+
+----------------------------------------------------------------------
+Top 10 by self_cpu_time_total
+----------------------------------------------------------------------
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                  cudaStreamSynchronize        31.80%        2.672s        31.81%        2.673s      21.045ms       0.000us         0.00%       2.176us       0.017us           127  
+                                       cudaLaunchKernel        14.17%        1.190s        14.34%        1.205s      10.812us      42.238us         0.00%      22.857ms       0.205us        111420  
+                                    Command Buffer Full        12.29%        1.032s        12.29%        1.032s     108.944us      50.317ms         0.74%      50.317ms       5.311us          9475  
+                                  _LayerNormMLPBackward         3.77%     316.609ms         6.10%     512.179ms     406.491us        1.188s        17.38%        1.188s     942.807us          1260  
+                        DistributedDataParallel.forward         2.83%     237.674ms        22.53%        1.893s      30.042ms       0.000us         0.00%        2.024s      32.127ms            63  
+                                            aten::empty         2.76%     232.243ms         2.76%     232.243ms       1.845us       0.000us         0.00%       0.000us       0.000us        125892  
+                                          _LayerNormMLP         2.57%     215.616ms         3.86%     324.290ms     257.373us     569.566ms         8.33%     586.801ms     465.715us          1260  
+                               _LayerNormLinearBackward         2.44%     205.401ms         3.38%     284.137ms     225.505us     448.652ms         6.56%     448.652ms     356.073us          1260  
+                                        _LinearBackward         2.21%     185.456ms         5.38%     451.929ms     341.594us     505.225ms         7.39%     507.514ms     383.609us          1323  
+                                       _LayerNormLinear         1.74%     146.208ms         2.65%     222.276ms     176.409us     196.029ms         2.87%     210.524ms     167.082us          1260  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 8.401s
+Self CUDA time total: 6.836s
+
+
+================================================================================
+Profiling complete.
+================================================================================
