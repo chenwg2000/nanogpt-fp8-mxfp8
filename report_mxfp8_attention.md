@@ -16,7 +16,7 @@ Comparison on NVIDIA RTX 5090 (SM 12.0, Blackwell consumer)
 | Training steps | 50 |
 | Transformer Engine | 2.13.0.dev0+c93ca27a (source build) |
 | PyTorch | 2.11.0a0+git5e4d6fb (source build, CUDA 13.0) |
-| Flash Attention | MXFP8 branch with native fwd+bwd kernels for SM 12.0 |
+| Flash Attention | MXFP8 branch with native fwd+bwd kernels for SM 12.0 (built 2026-03-12, async dO + LPT scheduling) |
 
 ## Configurations Tested
 
@@ -24,6 +24,7 @@ Comparison on NVIDIA RTX 5090 (SM 12.0, Blackwell consumer)
 |---|---|---|---|
 | 1 | **MXFP8 + MXFP8 Attention** | MXFP8 fwd + MXFP8 bwd (custom `Block`, direct FP8 cast, torch.compile) | FP8 GEMMs (MXFP8BlockScaling) |
 | 2 | **TE + MXFP8BlockScaling** | BF16 SDPA fwd + bwd (`te.TransformerLayer`) | FP8 GEMMs (MXFP8BlockScaling) |
+| 3 | **TE + Float8BlockScaling** | BF16 SDPA fwd + bwd (`te.TransformerLayer`) | FP8 GEMMs (Float8BlockScaling) |
 
 > **Note:** On SM 12.0, TE disables FP8 FlashAttention and FusedAttention entirely
 > (`dot_product_attention/utils.py` line ~511). All TE paths use BF16 SDPA for attention.
@@ -116,6 +117,7 @@ BF16), giving higher numerical stability in attention despite lower-precision in
 | v3 | Native fwd+bwd, direct FP8 cast (no quantization) | 129 ms | 53% | 6.11 |
 | v3+ | v3 + updated flash-attn library | 120 ms | 57% | 6.11 |
 | **v3+ compiled** | **v3+ with torch.compile on pre-attention** | **114 ms** | **60%** | **6.12** |
+| **v4 (latest)** | **v3+ compiled + async dO load + LPT scheduling** | **113 ms** | **60.3%** | **6.10** |
 
 Key fixes at each stage:
 - **v1→v2**: Native backward kernel fixed fwd/bwd precision mismatch (loss spikes eliminated)
@@ -123,6 +125,7 @@ Key fixes at each stage:
 - **v2→v3**: Direct FP8 cast eliminated 0.50 ms/layer Python quantization overhead
 - **v3→v3+**: Updated flash-attention library optimized kernel performance
 - **v3+→v3+ compiled**: `torch.compile` on `_pre_attention` fuses surrounding tensor ops (~6ms savings)
+- **v3+ compiled→v4**: Updated flash-attn library with async cp.async dO load, LPT causal scheduling, L2 prefetch hints, vectorized epilogue stores (~1ms savings)
 
 ### Fused kernel investigation (tested, reverted)
 A fully fused kernel (`flash_attn_mxfp8_fused_func` + `flash_attn_mxfp8_fused_bwd_func`)
@@ -131,49 +134,50 @@ The fused forward saved 0.037ms/layer, but the fused backward was 0.711ms/layer 
 than autograd's handling of separate TE backward kernels. Net: +0.637ms/layer = +12.7ms/iter
 worse. Reverted to unfused v3+ with torch.compile.
 
-## 3. Training Throughput (Latest: v3+ compiled)
+## 3. Training Throughput (Latest: v4)
 
 | Config | Avg iter time | MFU | Speedup vs BF16 |
 |:---|---:|---:|---:|
-| **MXFP8 + MXFP8 Attention (v3+ compiled)** | **114 ms** | **60%** | **1.57x** |
+| **MXFP8 + MXFP8 Attention (v4)** | **113 ms** | **60.3%** | **1.58x** |
+| TE + Float8BlockScaling | 114 ms | 60.0% | **1.57x** |
 | TE + MXFP8BlockScaling | 111 ms | 61% | **1.61x** |
 | BF16 baseline | 179 ms | 38% | 1.00x |
 
-The gap between MXFP8 attention and TE baseline is now **~3 ms** (~114 vs ~111 ms).
+The MXFP8 attention path now **matches or slightly beats** the TE Float8BlockScaling baseline
+(~113 ms vs ~114 ms). The gap to TE MXFP8BlockScaling is **~2 ms** (~113 vs ~111 ms).
 
 ## 4. Training Convergence (50 steps, latest)
 
 ### Loss curve
 
 ```
-Step  MXFP8 Attn   TE MXFP8
-----  ----------  ---------
-   1     10.999     10.999
-   2     10.073     10.072
-   3      8.977      8.982
-   4      8.657      8.655
-   5      8.536      8.581
-  10      9.372      9.845
-  15      6.700      7.009
-  20      6.977      7.128
-  25      6.472      6.609
-  30      6.299      6.394
-  35      6.259      6.307
-  40      6.218      6.245
-  45      6.207      6.242
-  49      6.121      6.060
+Step  MXFP8 Attn (v4)  TE BlockFP8   TE MXFP8
+----  ----------------  -----------  ---------
+   1           10.999       10.999     10.999
+   2           10.073       10.072     10.072
+   3            8.977        8.982      8.982
+   4            8.657        8.656      8.655
+   5            8.536        8.583      8.581
+  10            9.574        9.903      9.845
+  15            6.631        6.976      7.009
+  20            6.971        7.206      7.128
+  25            6.462        6.603      6.609
+  30            6.296        6.382      6.394
+  35            6.256        6.292      6.307
+  40            6.201        6.239      6.245
+  45            6.190        6.228      6.242
+  49            6.100        6.063      6.060
 ```
 
 ### Key metrics
 
-| Metric | MXFP8 Attn | TE MXFP8 |
-|:---|---:|---:|
-| Final train loss | 6.121 | 6.060 |
-| Val loss @40 | 6.301 | 6.340 |
-| Grad norm @49 | 0.177 | 0.148 |
+| Metric | MXFP8 Attn (v4) | TE BlockFP8 | TE MXFP8 |
+|:---|---:|---:|---:|
+| Final train loss | 6.100 | 6.063 | 6.060 |
+| Val loss @40 | 6.294 | 6.327 | 6.340 |
 
-Convergence is essentially identical. Both paths reach ~6.1 final loss with stable
-gradient norms. MXFP8 attention achieves slightly better val loss (6.30 vs 6.34),
+Convergence is essentially identical across all three configurations. All reach ~6.1
+final loss. MXFP8 attention achieves the best val loss (6.29 vs 6.33/6.34),
 likely from the FP32 softmax precision advantage.
 
 ## 5. Per-Layer Operator Breakdown
@@ -273,21 +277,48 @@ were already fast). The fused backward was 0.711ms/layer slower because autograd
 of TE's separate C++ backward kernels is more efficient than the fused backward kernel.
 The unfused path with `torch.compile` remains the better architecture.
 
-## 8. Summary
+## 8. Flash Attention Kernel Optimizations (v4)
+
+The updated flash-attn library includes several SM120 backward kernel optimizations:
+
+| Optimization | Impact |
+|:---|:---|
+| **Async cp.async dO load** | Replace blocking `load_tile_swizzled` with `cp.async.cg.shared.global`, overlaps GMEM→SMEM with GEMM-1 + softmax compute |
+| **LPT causal scheduling** | Reverse m_block→blockIdx.x mapping so heavy CTAs launch first (2-6% fwd speedup) |
+| **L2 prefetch for dO** | `prefetch.global.L2` hints for next M-block's dO_fp8 (2-12% bwd speedup on small configs) |
+| **Vectorized dK/dV epilogue** | Pack BF16 pairs into uint32 for 32-bit GMEM stores (136 vs 257 STG instructions) |
+| **Dead code removal** | Removed unused BF16→FP8 convert path (superseded by dO pre-quantization) |
+
+### Memory load patterns
+
+| Operand | Forward | Backward |
+|:---|:---|:---|
+| Q | Manual uint4 loads + SW128 swizzle | TMA (single-stage pipeline, prefetched per M-block) |
+| K | TMA (multi-stage async pipeline) | Manual uint4 loads + SW128 swizzle (resident per N-block) |
+| V | TMA (multi-stage async pipeline) | Manual uint4 loads + SW128 swizzle (resident per N-block) |
+| dO | — | **cp.async** (overlapped with compute) + L2 prefetch |
+| SMEM→Reg | LDSM (SM75_U32x4/U32x2_LDSM_N) | LDSM (SM75_U32x4/U32x2_LDSM_N) |
+
+## 9. Summary
 
 | Rank | Config | Iter time | MFU | Final loss | FP8 GEMMs/layer |
 |---|---|---:|---:|---:|---:|
 | 1 | TE + MXFP8BlockScaling | 111 ms | 61% | 6.060 | 12 |
-| 2 | MXFP8 + MXFP8 Attention (v3+ compiled) | 114 ms | 60% | 6.121 | 18 |
-| 3 | BF16 baseline | 179 ms | 38% | 6.017 | 0 |
+| 2 | **MXFP8 + MXFP8 Attention (v4)** | **113 ms** | **60.3%** | **6.100** | **18** |
+| 3 | TE + Float8BlockScaling | 114 ms | 60.0% | 6.063 | 12 |
+| 4 | BF16 baseline | 179 ms | 38% | 6.017 | 0 |
 
 ### Recommendation
 
-**MXFP8 attention with native fwd+bwd kernels and torch.compile** is at near-parity with
-the TE baseline on SM 12.0 (114 ms vs 111 ms, 60% vs 61% MFU) with matching convergence
-(6.12 vs 6.06 final loss, 6.30 vs 6.34 val loss). It uses FP8 for all 18 GEMMs per layer
-(vs TE's 12), with FP32 softmax providing higher intermediate precision than TE's BF16 softmax.
+**MXFP8 attention with native fwd+bwd kernels and torch.compile** has reached near-parity
+with TE baselines on SM 12.0. It now **matches TE Float8BlockScaling** (~113 ms vs ~114 ms)
+and is within **~2 ms of TE MXFP8BlockScaling** (~113 vs ~111 ms, 60.3% vs 61% MFU).
+Convergence is equivalent across all configs (~6.1 final loss), with MXFP8 attention
+achieving the best val loss (6.29) thanks to FP32 softmax precision.
 
-The ~3 ms remaining gap comes from separate RoPE + QK RMSNorm kernel launches that
-`torch.compile` partially but not fully fuses. TE avoids this by integrating these ops
-directly into its attention module's C++ implementation.
+The custom path uses FP8 for all 18 GEMMs per layer (vs TE's 12), with FP32 softmax
+providing higher intermediate precision than TE's BF16 softmax.
+
+The remaining ~2 ms gap to TE MXFP8BlockScaling comes from:
+1. Separate RoPE + QK RMSNorm kernel launches (`torch.compile` partially but not fully fuses)
+2. The attention backward kernel's FP32→FP8→SMEM→LDSM round-trip chain between 5 interleaved GEMMs (architectural bottleneck on SM120 without TMEM/WGMMA)
