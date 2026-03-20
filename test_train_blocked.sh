@@ -1,0 +1,1 @@
+NCCL_P2P_LEVEL=SYS NCCL_CUMEM_ENABLE=0 USE_MXFP8_ATTN=False USE_FP8=TRUE RECIPE=Float8BlockScaling OMP_NUM_THREADS=1  torchrun --standalone --nproc-per-node=1 train_test.py 
