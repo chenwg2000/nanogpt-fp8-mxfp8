@@ -42,47 +42,47 @@ USE_AC_LM_HEAD = False  # Enable activation checkpointing for lm_head
 # Wandb logging
 USE_WANDB = False
 WANDB_PROJECT = "nanogpt-fp8-optimization-large"
-WANDB_RUN_NAME = f"bf16-linear-normal-attention"  # Set to None for auto-generated name
+WANDB_RUN_NAME = f"bf16-linear-mxfp8-attention"  # Set to None for auto-generated name
 
 
-# # hyperparameters
-# total_batch_size = 512000 # total tokens per batch
-# batch_size = int(os.environ.get('BATCH_SIZE', '4'))  # how many independent sequences will we process in parallel?
-# block_size = 2048 # what is the maximum context length for predictions?
-# max_iters = int(os.environ.get('MAX_ITERS', '20117'))
-# learning_rate = 1e-3
-# device = 'cuda' if torch.cuda.is_available() else 'cpu'
-# eval_iters = 50
-# n_layer = 20
-# n_embd = n_layer*64
-# n_head = max(1, (n_embd + 127) // 128)
-# dropout = 0.0
-# vocab_size = 65536
-# dataset = 'openwebtext-1M'  # name of the dataset subdirectory in ./data/
-# input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
-# input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+# hyperparameters
+total_batch_size = 512000 # total tokens per batch
+batch_size = int(os.environ.get('BATCH_SIZE', '4'))  # how many independent sequences will we process in parallel?
+block_size = 2048 # what is the maximum context length for predictions?
+max_iters = int(os.environ.get('MAX_ITERS', '20117'))
+learning_rate = 1e-3
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+eval_iters = 50
+n_layer = 20
+n_embd = n_layer*64
+n_head = max(1, (n_embd + 127) // 128)
+dropout = 0.0
+vocab_size = 65536
+dataset = 'openwebtext-1M'  # name of the dataset subdirectory in ./data/
+input_bin : str = 'data2/fineweb10B/fineweb_train_*.bin' # input .bin to train on
+input_val_bin : str = 'data2/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
 
 # warmup_iters = 400  # Number of warmup steps
 # lr_decay_iters = max_iters  # Should be ~= max_iters
 # min_lr = 1e-8  # Minimum learning rate (10% of max LR is typical)
-# hyperparameters
-total_batch_size = 524288 # total tokens per batch
-batch_size = 16 # how many independent sequences will we process in parallel?
-block_size = 1024 # what is the maximum context length for predictions?
-max_iters = int(os.environ.get('MAX_ITERS', '6484'))
-learning_rate = 1e-3
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-eval_iters = 50
-n_layer = 12
-n_embd = n_layer*64
-n_head = max(1, (n_embd + 127) // 128)
-dropout = 0.0
-vocab_size = 50304
-dataset = 'openwebtext-1M'  # name of the dataset subdirectory in ./data/
-input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
-input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+# # hyperparameters
+# total_batch_size = 524288 # total tokens per batch
+# batch_size = 16 # how many independent sequences will we process in parallel?
+# block_size = 1024 # what is the maximum context length for predictions?
+# max_iters = int(os.environ.get('MAX_ITERS', '6484'))
+# learning_rate = 1e-3
+# device = 'cuda' if torch.cuda.is_available() else 'cpu'
+# eval_iters = 50
+# n_layer = 12
+# n_embd = n_layer*64
+# n_head = max(1, (n_embd + 127) // 128)
+# dropout = 0.0
+# vocab_size = 50304
+# dataset = 'openwebtext-1M'  # name of the dataset subdirectory in ./data/
+# input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
+# input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
 
-warmup_iters = 400  # Number of warmup steps
+warmup_iters = 1200  # Number of warmup steps
 lr_decay_iters = max_iters - warmup_iters  # Should be ~= max_iters
 min_lr = 1e-8  # Minimum learning rate (10% of max LR is typical)
 
