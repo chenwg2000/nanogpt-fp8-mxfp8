@@ -318,7 +318,7 @@ class MXFP8Attention(torch.autograd.Function):
         dq, dk, dv = flash_attn_mxfp8_bwd_func(
             grad_output, q_fp8, k_fp8, v_fp8,
             out, softmax_lse,
-            identity_scale, identity_scale,
+            identity_scale, identity_scale, identity_scale,
             causal=True,
         )
         return dq, dk, dv
