@@ -25,7 +25,7 @@ from torch.distributed.device_mesh import init_device_mesh
 # MXFP8 Flash Attention imports
 import sys
 sys.path.insert(0, "/home/nanogpt/prj/fp8_flashattention/flash-attention/hopper")
-from flash_attn_interface import flash_attn_mxfp8_func, flash_attn_mxfp8_bwd_func
+from flash_attn_interface import flash_attn_mxfp8_func, flash_attn_mxfp8_bwd_func, flash_attn_int8qk_func
 from transformer_engine.pytorch.attention.rope import apply_rotary_pos_emb
 
 USE_MXFP8_FLASH_ATTN = os.environ.get('USE_MXFP8_ATTN', 'True').lower() != 'false'
@@ -327,6 +327,39 @@ class MXFP8Attention(torch.autograd.Function):
         return dq, dk, dv
 
 
+class INT8Attention(torch.autograd.Function):
+    """INT8 QK + FP8 PV attention via custom CUDA kernel.
+
+    Forward: INT8 per-row Q/K (4x better than FP8 for unit-scale Gaussian)
+             + FP8 V, using INT8 IMMA for GEMM-I and FP8 block-scaled for GEMM-II.
+    Backward: FP8 MXFP8 backward (same as pure FP8 path, cos>0.996).
+    """
+    @staticmethod
+    def forward(ctx, q, k, v):
+        B, T, H, D = q.shape
+        # INT8QK forward kernel handles quantization internally via flash_attn_int8qk_func
+        out, softmax_lse = flash_attn_int8qk_func(q, k, v, causal=True)
+        # Save FP8 tensors for backward (same as MXFP8Attention)
+        q_fp8 = q.to(torch.float8_e4m3fn)
+        k_fp8 = k.to(torch.float8_e4m3fn)
+        v_fp8 = v.to(torch.float8_e4m3fn)
+        identity_scale = torch.full(
+            (B, H, T, D // 32), 127, dtype=torch.uint8, device=q.device)
+        ctx.save_for_backward(q_fp8, k_fp8, v_fp8, out, softmax_lse, identity_scale)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        q_fp8, k_fp8, v_fp8, out, softmax_lse, identity_scale = ctx.saved_tensors
+        dq, dk, dv = flash_attn_mxfp8_bwd_func(
+            grad_output, q_fp8, k_fp8, v_fp8,
+            out, softmax_lse,
+            identity_scale, identity_scale, identity_scale,
+            causal=True,
+        )
+        return dq, dk, dv
+
+
 class Block(nn.Module):
     """Custom transformer block using MXFP8 flash attention with TE linear layers."""
 
@@ -334,7 +367,7 @@ class Block(nn.Module):
         super().__init__()
         self.head_dim = hidden_size // num_attention_heads
         self.num_heads = num_attention_heads
-        self.use_fp8_attn = use_fp8_attn
+        self.use_fp8_attn = use_fp8_attn  # True=FP8, False=BF16, 'int8'=INT8
         # Attention sub-layer
         self.qkv_proj = te.LayerNormLinear(
             hidden_size, 3 * hidden_size,
@@ -381,8 +414,10 @@ class Block(nn.Module):
         v = v.reshape(B, T, self.num_heads, self.head_dim)
         # Compiled RoPE + QK RMSNorm
         q, k, v = self._pre_attention(q, k, v, rotary_pos_emb)
-        # Attention: FP8 MXFP8 kernel or BF16 SDPA (per-layer choice)
-        if self.use_fp8_attn:
+        # Attention: FP8 MXFP8 kernel, INT8 quantized SDPA, or BF16 SDPA
+        if self.use_fp8_attn == 'int8':
+            attn_out = INT8Attention.apply(q, k, v)
+        elif self.use_fp8_attn:
             attn_out = MXFP8Attention.apply(q, k, v)
         else:
             attn_out = F.scaled_dot_product_attention(
@@ -412,9 +447,13 @@ class LLM(nn.Module):
         if USE_MXFP8_FLASH_ATTN:
             # BF16_ATTN_LAYERS: last N layers use BF16 SDPA, rest FP8
             # BF16_ATTN_FIRST: first N layers use BF16 SDPA, rest FP8
+            # INT8_ATTN=1: use INT8 per-row quantized SDPA for all layers
             bf16_first = int(os.environ.get('BF16_ATTN_FIRST', '0'))
+            use_int8 = os.environ.get('INT8_ATTN', '0') == '1'
             fp8_cutoff = n_layer - BF16_ATTN_LAYERS
             def use_fp8(i):
+                if use_int8:
+                    return 'int8'
                 if bf16_first > 0:
                     return i >= bf16_first  # first N are BF16
                 return i < fp8_cutoff       # last N are BF16
