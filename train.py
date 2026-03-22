@@ -29,6 +29,9 @@ from flash_attn_interface import flash_attn_mxfp8_func, flash_attn_mxfp8_bwd_fun
 from transformer_engine.pytorch.attention.rope import apply_rotary_pos_emb
 
 USE_MXFP8_FLASH_ATTN = os.environ.get('USE_MXFP8_ATTN', 'True').lower() != 'false'
+# Number of layers using BF16 SDPA instead of FP8 (from the end). E.g., BF16_ATTN_LAYERS=4
+# makes the last 4 layers use BF16 attention. Set to 0 for all-FP8, n_layer for all-BF16.
+BF16_ATTN_LAYERS = int(os.environ.get('BF16_ATTN_LAYERS', '0'))
 
 USE_FP8 = os.environ.get('USE_FP8', 'True').lower() != 'false'
 USE_NVFP4 = False
@@ -327,10 +330,11 @@ class MXFP8Attention(torch.autograd.Function):
 class Block(nn.Module):
     """Custom transformer block using MXFP8 flash attention with TE linear layers."""
 
-    def __init__(self, hidden_size, ffn_hidden_size, num_attention_heads):
+    def __init__(self, hidden_size, ffn_hidden_size, num_attention_heads, use_fp8_attn=True):
         super().__init__()
         self.head_dim = hidden_size // num_attention_heads
         self.num_heads = num_attention_heads
+        self.use_fp8_attn = use_fp8_attn
         # Attention sub-layer
         self.qkv_proj = te.LayerNormLinear(
             hidden_size, 3 * hidden_size,
@@ -377,8 +381,13 @@ class Block(nn.Module):
         v = v.reshape(B, T, self.num_heads, self.head_dim)
         # Compiled RoPE + QK RMSNorm
         q, k, v = self._pre_attention(q, k, v, rotary_pos_emb)
-        # MXFP8 flash attention forward and backward
-        attn_out = MXFP8Attention.apply(q, k, v)
+        # Attention: FP8 MXFP8 kernel or BF16 SDPA (per-layer choice)
+        if self.use_fp8_attn:
+            attn_out = MXFP8Attention.apply(q, k, v)
+        else:
+            attn_out = F.scaled_dot_product_attention(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                is_causal=True).transpose(1, 2)
         attn_out = attn_out.reshape(B, T, C)
         attn_out = self.out_proj(attn_out, is_first_microbatch=is_first_microbatch)
         x = residual + attn_out
@@ -401,10 +410,19 @@ class LLM(nn.Module):
             pretrained_max_position_embeddings=block_size
         )
         if USE_MXFP8_FLASH_ATTN:
+            # BF16_ATTN_LAYERS: last N layers use BF16 SDPA, rest FP8
+            # BF16_ATTN_FIRST: first N layers use BF16 SDPA, rest FP8
+            bf16_first = int(os.environ.get('BF16_ATTN_FIRST', '0'))
+            fp8_cutoff = n_layer - BF16_ATTN_LAYERS
+            def use_fp8(i):
+                if bf16_first > 0:
+                    return i >= bf16_first  # first N are BF16
+                return i < fp8_cutoff       # last N are BF16
             self.blocks = nn.ModuleDict({f"block_{i}": Block(
                 hidden_size=n_embd,
                 ffn_hidden_size=4*n_embd,
                 num_attention_heads=n_head,
+                use_fp8_attn=use_fp8(i),
             ) for i in range(n_layer)})
         else:
             self.blocks = nn.ModuleDict({f"block_{i}": te.TransformerLayer(
