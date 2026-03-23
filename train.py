@@ -25,7 +25,7 @@ from torch.distributed.device_mesh import init_device_mesh
 # MXFP8 Flash Attention imports
 import sys
 sys.path.insert(0, "/home/nanogpt/prj/fp8_flashattention/flash-attention/hopper")
-from flash_attn_interface import flash_attn_mxfp8_func, flash_attn_mxfp8_bwd_func, flash_attn_int8qk_func, flash_attn_allint8_func
+from flash_attn_interface import flash_attn_mxfp8_func, flash_attn_mxfp8_bwd_func, flash_attn_int8qk_func, flash_attn_allint8_func, flash_attn_allint8_bwd_func
 from transformer_engine.pytorch.attention.rope import apply_rotary_pos_emb
 
 USE_MXFP8_FLASH_ATTN = os.environ.get('USE_MXFP8_ATTN', 'True').lower() != 'false'
@@ -328,33 +328,24 @@ class MXFP8Attention(torch.autograd.Function):
 
 
 class INT8Attention(torch.autograd.Function):
-    """All-INT8 forward + FP8 backward.
+    """All-INT8 forward + all-INT8 backward.
 
-    Forward: All-INT8 kernel (INT8 GEMM-I + INT8 GEMM-II, cos=0.9999 vs BF16).
-    Backward: FP8 MXFP8 backward (consistent with FP8 quantization, no NaN).
-    Note: SDPA backward was tested but NaN'd at step 80 (Jacobian mismatch from
-    INT8 P quantization in forward vs BF16 P recomputation in SDPA backward).
+    Both forward and backward use INT8 IMMA for all GEMMs.
+    Forward: INT8 GEMM-I (Q@K^T) + INT8 GEMM-II (P@V^T)
+    Backward: 5 INT8 GEMMs (S, dP, dV, dK, dQ) with adaptive per-row scales.
     """
     @staticmethod
     def forward(ctx, q, k, v):
-        B, T, H, D = q.shape
         out, softmax_lse = flash_attn_allint8_func(q, k, v, causal=True)
-        # Save FP8 tensors for FP8 backward
-        q_fp8 = q.to(torch.float8_e4m3fn)
-        k_fp8 = k.to(torch.float8_e4m3fn)
-        v_fp8 = v.to(torch.float8_e4m3fn)
-        identity_scale = torch.full(
-            (B, H, T, D // 32), 127, dtype=torch.uint8, device=q.device)
-        ctx.save_for_backward(q_fp8, k_fp8, v_fp8, out, softmax_lse, identity_scale)
+        # Save BF16 Q/K/V for INT8 backward (will be re-quantized there)
+        ctx.save_for_backward(q, k, v, out, softmax_lse)
         return out
 
     @staticmethod
     def backward(ctx, grad_output):
-        q_fp8, k_fp8, v_fp8, out, softmax_lse, identity_scale = ctx.saved_tensors
-        dq, dk, dv = flash_attn_mxfp8_bwd_func(
-            grad_output, q_fp8, k_fp8, v_fp8,
-            out, softmax_lse,
-            identity_scale, identity_scale, identity_scale,
+        q, k, v, out, softmax_lse = ctx.saved_tensors
+        dq, dk, dv = flash_attn_allint8_bwd_func(
+            grad_output, q, k, v, out, softmax_lse,
             causal=True,
         )
         return dq, dk, dv
