@@ -25,7 +25,7 @@ from torch.distributed.device_mesh import init_device_mesh
 # MXFP8 Flash Attention imports
 import sys
 sys.path.insert(0, "/home/nanogpt/prj/fp8_flashattention/flash-attention/hopper")
-from flash_attn_interface import flash_attn_mxfp8_func, flash_attn_mxfp8_bwd_func, flash_attn_int8qk_func
+from flash_attn_interface import flash_attn_mxfp8_func, flash_attn_mxfp8_bwd_func, flash_attn_int8qk_func, flash_attn_allint8_func
 from transformer_engine.pytorch.attention.rope import apply_rotary_pos_emb
 
 USE_MXFP8_FLASH_ATTN = os.environ.get('USE_MXFP8_ATTN', 'True').lower() != 'false'
@@ -337,8 +337,8 @@ class INT8Attention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v):
         B, T, H, D = q.shape
-        # INT8QK forward kernel handles quantization internally via flash_attn_int8qk_func
-        out, softmax_lse = flash_attn_int8qk_func(q, k, v, causal=True)
+        # All-INT8 forward: INT8 GEMM-I (Q@K^T) + INT8 GEMM-II (P@V^T)
+        out, softmax_lse = flash_attn_allint8_func(q, k, v, causal=True)
         # Save FP8 tensors for backward (same as MXFP8Attention)
         q_fp8 = q.to(torch.float8_e4m3fn)
         k_fp8 = k.to(torch.float8_e4m3fn)
