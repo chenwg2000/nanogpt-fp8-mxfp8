@@ -328,18 +328,18 @@ class MXFP8Attention(torch.autograd.Function):
 
 
 class INT8Attention(torch.autograd.Function):
-    """INT8 QK + FP8 PV attention via custom CUDA kernel.
+    """All-INT8 forward + FP8 backward.
 
-    Forward: INT8 per-row Q/K (4x better than FP8 for unit-scale Gaussian)
-             + FP8 V, using INT8 IMMA for GEMM-I and FP8 block-scaled for GEMM-II.
-    Backward: FP8 MXFP8 backward (same as pure FP8 path, cos>0.996).
+    Forward: All-INT8 kernel (INT8 GEMM-I + INT8 GEMM-II, cos=0.9999 vs BF16).
+    Backward: FP8 MXFP8 backward (consistent with FP8 quantization, no NaN).
+    Note: SDPA backward was tested but NaN'd at step 80 (Jacobian mismatch from
+    INT8 P quantization in forward vs BF16 P recomputation in SDPA backward).
     """
     @staticmethod
     def forward(ctx, q, k, v):
         B, T, H, D = q.shape
-        # All-INT8 forward: INT8 GEMM-I (Q@K^T) + INT8 GEMM-II (P@V^T)
         out, softmax_lse = flash_attn_allint8_func(q, k, v, causal=True)
-        # Save FP8 tensors for backward (same as MXFP8Attention)
+        # Save FP8 tensors for FP8 backward
         q_fp8 = q.to(torch.float8_e4m3fn)
         k_fp8 = k.to(torch.float8_e4m3fn)
         v_fp8 = v.to(torch.float8_e4m3fn)
