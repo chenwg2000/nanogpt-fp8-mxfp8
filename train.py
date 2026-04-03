@@ -29,6 +29,12 @@ from flash_attn_interface import flash_attn_mxfp8_func, flash_attn_mxfp8_bwd_fun
 from transformer_engine.pytorch.attention.rope import apply_rotary_pos_emb
 
 USE_MXFP8_FLASH_ATTN = os.environ.get('USE_MXFP8_ATTN', 'True').lower() != 'false'
+USE_HADAMARD = os.environ.get('USE_HADAMARD', 'False').lower() == 'true'
+# Attention variant: 'softmax' (default), 'sigmoid', 'gumbel'
+ATTN_VARIANT = os.environ.get('ATTN_VARIANT', 'softmax')
+GUMBEL_TAU = float(os.environ.get('GUMBEL_TAU', '1.0'))  # Gumbel-softmax temperature
+# Q-noise: add small Gaussian noise to Q before FP8 cast (stochastic attention regularizer)
+Q_NOISE_STD = float(os.environ.get('Q_NOISE_STD', '0.0'))  # 0 = disabled, try 0.05-0.2
 # Number of layers using BF16 SDPA instead of FP8 (from the end). E.g., BF16_ATTN_LAYERS=4
 # makes the last 4 layers use BF16 attention. Set to 0 for all-FP8, n_layer for all-BF16.
 BF16_ATTN_LAYERS = int(os.environ.get('BF16_ATTN_LAYERS', '0'))
@@ -287,18 +293,46 @@ def te_output_layer_init_method(weight):
     torch.nn.init.zeros_(weight)
 
 
+if USE_HADAMARD:
+    sys.path.insert(0, "/home/nanogpt/prj/fp8_flashattention/flash-attention/hopper")
+    from hadamard_transform import fast_walsh_hadamard_transform
+    # Pre-build and cache the Hadamard matrix on first use
+    _hadamard_ready = False
+    def _ensure_hadamard(d, device):
+        global _hadamard_ready
+        if not _hadamard_ready:
+            from hadamard_transform import _get_hadamard_matrix
+            _get_hadamard_matrix(d, device)
+            _hadamard_ready = True
+
+
 class MXFP8Attention(torch.autograd.Function):
     """MXFP8 flash attention forward and backward.
 
     After QK RMSNorm, values are already normalized (~unit scale),
     so we cast directly to FP8 with identity scales (2^0 = 1.0)
     instead of expensive per-block quantization.
+
+    When USE_HADAMARD=True, applies Walsh-Hadamard Transform to Q/K
+    before FP8 cast to redistribute outliers (QK^T is invariant under WHT).
     """
 
     @staticmethod
     def forward(ctx, q, k, v):
         # q, k, v: (B, T, H, D) in BF16 (post-RMSNorm, ~unit scale)
         B, T, H, D = q.shape
+        ctx.use_hadamard = USE_HADAMARD
+
+        if USE_HADAMARD:
+            _ensure_hadamard(D, q.device)
+            q = fast_walsh_hadamard_transform(q.float()).to(q.dtype)
+            k = fast_walsh_hadamard_transform(k.float()).to(k.dtype)
+
+        # Per-element noise before FP8 cast (stochastic quantization regularizer)
+        if Q_NOISE_STD > 0 and q.requires_grad:
+            q = q + torch.randn_like(q) * Q_NOISE_STD
+            k = k + torch.randn_like(k) * Q_NOISE_STD
+
         # Direct cast — no per-block quantization needed after RMSNorm
         q_fp8 = q.to(torch.float8_e4m3fn)
         k_fp8 = k.to(torch.float8_e4m3fn)
@@ -324,7 +358,107 @@ class MXFP8Attention(torch.autograd.Function):
             identity_scale, identity_scale, identity_scale,
             causal=True,
         )
+        if ctx.use_hadamard:
+            dq = fast_walsh_hadamard_transform(dq.float()).to(dq.dtype)
+            dk = fast_walsh_hadamard_transform(dk.float()).to(dk.dtype)
         return dq, dk, dv
+
+
+class SigmoidAttention(torch.autograd.Function):
+    """BF16 attention with sigmoid instead of softmax.
+
+    P_ij = sigmoid(S_ij * scale) — element-wise, no row normalization.
+    Eliminates heavy-tailed P distribution (P ∈ (0,1) near-uniform for |S|<2).
+    Backward: dS = P*(1-P)*dP*scale — no dPsum term needed.
+    """
+    @staticmethod
+    @torch.amp.custom_fwd(device_type='cuda')
+    def forward(ctx, q, k, v):
+        B, T, H, D = q.shape
+        input_dtype = q.dtype
+        scale = D ** -0.5
+        Q = q.float().transpose(1, 2)  # (B, H, T, D)
+        K = k.float().transpose(1, 2)
+        V = v.float().transpose(1, 2)
+        S = torch.matmul(Q, K.transpose(-2, -1)) * scale
+        # Causal mask
+        mask = torch.triu(torch.ones(T, T, device=q.device, dtype=torch.bool), diagonal=1)
+        S.masked_fill_(mask, -1e9)  # large negative → sigmoid ≈ 0
+        P = torch.sigmoid(S)
+        P.masked_fill_(mask, 0.0)
+        O = torch.matmul(P, V)
+        ctx.save_for_backward(Q, K, V, P, mask)
+        ctx.scale = scale
+        ctx.input_dtype = input_dtype
+        return O.transpose(1, 2).to(input_dtype)
+
+    @staticmethod
+    @torch.amp.custom_bwd(device_type='cuda')
+    def backward(ctx, grad_output):
+        Q, K, V, P, mask = ctx.saved_tensors
+        scale = ctx.scale
+        dtype = ctx.input_dtype
+        dO = grad_output.float().transpose(1, 2)
+        V_f = V.float()
+        Q_f = Q.float()
+        K_f = K.float()
+        P_f = P.float()
+        dP = torch.matmul(dO, V_f.transpose(-2, -1))
+        dS = P_f * (1 - P_f) * dP * scale
+        dS.masked_fill_(mask, 0.0)
+        dQ = torch.matmul(dS, K_f).transpose(1, 2).to(dtype)
+        dK = torch.matmul(dS.transpose(-2, -1), Q_f).transpose(1, 2).to(dtype)
+        dV = torch.matmul(P_f.transpose(-2, -1), dO).transpose(1, 2).to(dtype)
+        return dQ, dK, dV
+
+
+class GumbelSoftmaxAttention(torch.autograd.Function):
+    """BF16 attention with Gumbel-softmax (temperature-controlled peakiness).
+
+    P = softmax((S + G) / tau) where G ~ Gumbel(0,1).
+    At low tau, P approaches one-hot → perfectly FP8-representable.
+    Uses STE: forward samples from Gumbel, backward ignores the noise.
+    """
+    @staticmethod
+    @torch.amp.custom_fwd(device_type='cuda')
+    def forward(ctx, q, k, v):
+        B, T, H, D = q.shape
+        input_dtype = q.dtype
+        scale = D ** -0.5
+        Q = q.float().transpose(1, 2)
+        K = k.float().transpose(1, 2)
+        V = v.float().transpose(1, 2)
+        S = torch.matmul(Q, K.transpose(-2, -1)) * scale
+        mask = torch.triu(torch.ones(T, T, device=q.device, dtype=torch.bool), diagonal=1)
+        S.masked_fill_(mask, float('-inf'))
+        if q.requires_grad:
+            U = torch.rand_like(S).clamp(1e-10, 1.0 - 1e-10)
+            G = -torch.log(-torch.log(U))
+            S_noisy = (S + G) / GUMBEL_TAU
+        else:
+            S_noisy = S / GUMBEL_TAU
+        P = torch.softmax(S_noisy, dim=-1)
+        O = torch.matmul(P, V)
+        ctx.save_for_backward(Q, K, V, P, mask)
+        ctx.scale = scale
+        ctx.input_dtype = input_dtype
+        return O.transpose(1, 2).to(input_dtype)
+
+    @staticmethod
+    @torch.amp.custom_bwd(device_type='cuda')
+    def backward(ctx, grad_output):
+        Q, K, V, P, mask = ctx.saved_tensors
+        scale = ctx.scale
+        dtype = ctx.input_dtype
+        dO = grad_output.float().transpose(1, 2)
+        V_f, Q_f, K_f, P_f = V.float(), Q.float(), K.float(), P.float()
+        dP = torch.matmul(dO, V_f.transpose(-2, -1))
+        dPsum = (P_f * dP).sum(dim=-1, keepdim=True)
+        dS = P_f * (dP - dPsum) * scale
+        dQ = torch.matmul(dS, K_f).transpose(1, 2).to(dtype)
+        dK = torch.matmul(dS.transpose(-2, -1), Q_f).transpose(1, 2).to(dtype)
+        dV = torch.matmul(P_f.transpose(-2, -1), dO).transpose(1, 2).to(dtype)
+        return dQ, dK, dV
 
 
 class INT8Attention(torch.autograd.Function):
@@ -405,8 +539,12 @@ class Block(nn.Module):
         v = v.reshape(B, T, self.num_heads, self.head_dim)
         # Compiled RoPE + QK RMSNorm
         q, k, v = self._pre_attention(q, k, v, rotary_pos_emb)
-        # Attention: FP8 MXFP8 kernel, INT8 quantized SDPA, or BF16 SDPA
-        if self.use_fp8_attn == 'int8':
+        # Attention: FP8 MXFP8 kernel, INT8, sigmoid, gumbel, or BF16 SDPA
+        if ATTN_VARIANT == 'sigmoid':
+            attn_out = SigmoidAttention.apply(q, k, v)
+        elif ATTN_VARIANT == 'gumbel':
+            attn_out = GumbelSoftmaxAttention.apply(q, k, v)
+        elif self.use_fp8_attn == 'int8':
             attn_out = INT8Attention.apply(q, k, v)
         elif self.use_fp8_attn:
             attn_out = MXFP8Attention.apply(q, k, v)
